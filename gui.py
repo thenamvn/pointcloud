@@ -100,18 +100,34 @@ class CylinderAnalyzerGUI(QMainWindow):
         
         # Z-window parameters
         self.z_window = QDoubleSpinBox()
-        self.z_window.setRange(1.0, 100.0)
-        self.z_window.setValue(9.0)
-        self.z_window.setSingleStep(0.5)
-        param_layout.addWidget(QLabel("Window Length (mm):"))
+        self.z_window.setRange(0.001, 0.1)  # 1mm to 100mm in meters
+        self.z_window.setValue(0.009)  # 9mm in meters
+        self.z_window.setSingleStep(0.0005)  # 0.5mm in meters
+        self.z_window.setDecimals(4)  # Show 4 decimal places for meters
+        self.z_window.setEnabled(True)
+        param_layout.addWidget(QLabel("Window Length (m):"))
         param_layout.addWidget(self.z_window)
         
         self.z_step = QDoubleSpinBox()
-        self.z_step.setRange(0.1, 50.0)
-        self.z_step.setValue(2.0)
-        self.z_step.setSingleStep(0.1)
-        param_layout.addWidget(QLabel("Z Step (mm):"))
+        self.z_step.setRange(0.0001, 0.05)  # 0.1mm to 50mm in meters
+        self.z_step.setValue(0.002)  # 2mm in meters
+        self.z_step.setSingleStep(0.0001)  # 0.1mm in meters
+        self.z_step.setDecimals(4)  # Show 4 decimal places for meters
+        self.z_step.setEnabled(True)
+        self.z_step.setReadOnly(False)
+        param_layout.addWidget(QLabel("Z Step (m):"))
         param_layout.addWidget(self.z_step)
+        
+        # Add slice thickness control
+        self.slice_thickness = QDoubleSpinBox()
+        self.slice_thickness.setRange(0.001, 0.05)  # 1mm to 50mm in meters
+        self.slice_thickness.setValue(0.005)  # 5mm default
+        self.slice_thickness.setSingleStep(0.001)
+        self.slice_thickness.setDecimals(4)
+        self.slice_thickness.setEnabled(True)
+        
+        param_layout.addWidget(QLabel("Slice Thickness (m):"))
+        param_layout.addWidget(self.slice_thickness)
         
         # Boundary method selection
         self.boundary_method = QComboBox()
@@ -123,6 +139,7 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.angle_bins.setRange(90, 3600)
         self.angle_bins.setValue(720)
         self.angle_bins.setSingleStep(90)
+        self.angle_bins.setEnabled(True)
         param_layout.addWidget(QLabel("Angle Bins:"))
         param_layout.addWidget(self.angle_bins)
         
@@ -141,19 +158,24 @@ class CylinderAnalyzerGUI(QMainWindow):
         control_layout.addWidget(param_group)
         control_layout.addStretch()
         
-        # Add Z slice visualization controls
+        # Add Z slice visualization controls with range limits
         slice_viz_group = QWidget()
         slice_viz_layout = QVBoxLayout(slice_viz_group)
         
         self.z_slice_input = QDoubleSpinBox()
+        # Initial range (will be updated when data loads)
         self.z_slice_input.setRange(-1000, 1000)
         self.z_slice_input.setValue(0.0)
         self.z_slice_input.setSingleStep(1.0)
+        self.z_slice_input.setEnabled(False)  # Disable until data loads
+        
         slice_viz_layout.addWidget(QLabel("Z Position to Visualize:"))
         slice_viz_layout.addWidget(self.z_slice_input)
         
         show_slice_btn = QPushButton("Show Slice at Z")
         show_slice_btn.clicked.connect(self.visualize_slice)
+        show_slice_btn.setEnabled(False)  # Disable until data loads
+        self.show_slice_btn = show_slice_btn
         slice_viz_layout.addWidget(show_slice_btn)
         
         # Add to control panel after parameters
@@ -257,6 +279,20 @@ class CylinderAnalyzerGUI(QMainWindow):
     def load_finished(self, result):
         points, num_points = result
         self.points = points
+        
+        # Update Z range based on loaded data
+        z_min = np.min(self.points[:, 2])
+        z_max = np.max(self.points[:, 2])
+        
+        # Set Z spinbox range and initial value
+        self.z_slice_input.setRange(z_min, z_max)
+        self.z_slice_input.setValue(z_min + (z_max - z_min)/2)  # Set to middle
+        self.z_slice_input.setSingleStep((z_max - z_min)/50)  # Reasonable step size
+        
+        # Enable Z slice controls
+        self.z_slice_input.setEnabled(True)
+        self.show_slice_btn.setEnabled(True)
+        
         self.display_point_cloud()
         self.progress_bar.setVisible(False)
         self.setEnabled(True)
@@ -551,8 +587,8 @@ class CylinderAnalyzerGUI(QMainWindow):
             return
             
         z_target = self.z_slice_input.value()
-        window_len = self.z_window.value()
-        dz = window_len / 2.0
+        slice_thickness = self.slice_thickness.value()  # Get slice thickness
+        dz = slice_thickness / 2.0
         
         # Get slice points
         mask = (self.points[:, 2] >= z_target - dz) & (self.points[:, 2] <= z_target + dz)
@@ -564,7 +600,7 @@ class CylinderAnalyzerGUI(QMainWindow):
             
         # Configure parameters
         params = {
-            'window_len': window_len,
+            'window_len': slice_thickness,  # Use slice thickness for window
             'z_step': self.z_step.value(),
             'boundary_method': self.boundary_method.currentText(),
             'angle_bins': self.angle_bins.value(),
@@ -576,14 +612,19 @@ class CylinderAnalyzerGUI(QMainWindow):
         try:
             # Process single slice
             analyzer = CylinderAnalyzer(Config(**params))
-            result_tuple = analyzer.process_slice(slice_points, z_target)
+            result = analyzer.process_slice(slice_points, z_target)
             
-            if result_tuple is None:
+            if result is None:
                 self.statusBar().showMessage("Could not process slice")
                 return
                 
-            result_dict, edge_xy, _, (xc, yc, R), ov = result_tuple
-            
+            # Unpack results (handle both tuple formats)
+            if len(result) == 5:
+                result_dict, edge_xy, _, (xc, yc, R), ov = result
+            else:
+                result_dict, edge_xy, (xc, yc, R) = result
+                ov = result_dict.get('ovality_pct', 0)
+        
             # Clear previous plot
             self.slice_figure.clear()
             ax = self.slice_figure.add_subplot(111)
@@ -598,8 +639,9 @@ class CylinderAnalyzerGUI(QMainWindow):
             # Plot points, boundary and fitted circle
             ax.scatter(plot_points[:, 0], plot_points[:, 1], 
                       s=1, alpha=0.3, label='Points')
-            ax.plot(edge_xy[:, 0], edge_xy[:, 1], 'k-', 
-                   linewidth=1, label='Boundary')
+            if edge_xy is not None:
+                ax.plot(edge_xy[:, 0], edge_xy[:, 1], 'k-', 
+                       linewidth=1, label='Boundary')
             
             # Plot fitted circle
             theta = np.linspace(0, 2*np.pi, 360)
@@ -611,13 +653,13 @@ class CylinderAnalyzerGUI(QMainWindow):
             # Plot center
             ax.plot(xc, yc, 'r+', markersize=10, label='Center')
             
-            # Add text with parameters
+            # Add text with parameters (in meters)
             info_text = (
-                f"Z = {z_target:.3f} ± {dz:.1f}\n"
+                f"Z = {z_target:.4f} ± {dz:.4f} m\n"
                 f"Points: {len(slice_points)}\n"
-                f"Center: ({xc:.3f}, {yc:.3f})\n"
-                f"Radius: {R:.3f}\n"
-                f"Ovality: {result_dict['ovality_pct']:.3f}%"
+                f"Center: ({xc:.4f}, {yc:.4f}) m\n"
+                f"Radius: {R:.4f} m\n"
+                f"Ovality: {ov:.3f}%"
             )
             ax.text(0.02, 0.98, info_text,
                    transform=ax.transAxes,
@@ -626,6 +668,8 @@ class CylinderAnalyzerGUI(QMainWindow):
             
             ax.set_aspect('equal')
             ax.grid(True)
+            ax.set_xlabel('X (m)')
+            ax.set_ylabel('Y (m)')
             
             # Adjust layout before adding legend
             self.slice_figure.tight_layout()
