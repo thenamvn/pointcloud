@@ -176,7 +176,17 @@ class CylinderAnalyzerGUI(QMainWindow):
         
         slice_viz_layout.addWidget(QLabel("Z Position to Visualize:"))
         slice_viz_layout.addWidget(self.z_slice_input)
-        
+
+        # Add slice thickness input for visualization (separate from analysis thickness)
+        self.viz_slice_thickness = QDoubleSpinBox()
+        self.viz_slice_thickness.setRange(0.1, 10.0)  # 0.1m to 10m
+        self.viz_slice_thickness.setValue(2.0)  # 2m default (larger than analysis thickness)
+        self.viz_slice_thickness.setSingleStep(0.1)
+        self.viz_slice_thickness.setDecimals(3)
+        self.viz_slice_thickness.setEnabled(False)  # Disable until data loads
+        slice_viz_layout.addWidget(QLabel("Viz Slice Thickness (m):"))
+        slice_viz_layout.addWidget(self.viz_slice_thickness)
+
         show_slice_btn = QPushButton("Show Slice at Z")
         show_slice_btn.clicked.connect(self.visualize_slice)
         show_slice_btn.setEnabled(False)  # Disable until data loads
@@ -325,12 +335,21 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.z_slice_input.setRange(z_min, z_max)
         self.z_slice_input.setValue(z_min + (z_max - z_min)/2)  # Set to middle
         self.z_slice_input.setSingleStep((z_max - z_min)/50)  # Reasonable step size
-        
+
+        # Set reasonable default thickness based on data range
+        z_range = z_max - z_min
+        default_thickness = max(0.5, z_range / 50)  # At least 0.5m or 1/50 of total range
+        self.viz_slice_thickness.setValue(default_thickness)
+
         # Enable Z slice controls
         self.z_slice_input.setEnabled(True)
         self.show_slice_btn.setEnabled(True)
+        self.viz_slice_thickness.setEnabled(True)
         
         self.display_point_cloud()
+
+        self.show_statistics()
+
         self.progress_bar.setVisible(False)
         self.setEnabled(True)
         self.statusBar().showMessage(f"Loaded {num_points} points")
@@ -419,7 +438,6 @@ class CylinderAnalyzerGUI(QMainWindow):
             self.current_results = results["results"]
             self.export_btn.setEnabled(True)
             self.display_results(self.current_results)
-            self.show_statistics()
             
             # Automatically visualize slices if checkbox is checked
             if self.auto_visualize.isChecked():
@@ -480,46 +498,109 @@ class CylinderAnalyzerGUI(QMainWindow):
         if self.points is None:
             return
             
+        # Get values for all three axes
+        x_values = self.points[:, 0]
+        y_values = self.points[:, 1]
         z_values = self.points[:, 2]
-        stats = {
-            'count': len(z_values),
-            'mean': np.mean(z_values),
-            'median': np.median(z_values),
-            'min': np.min(z_values),
-            'max': np.max(z_values),
-            'std': np.std(z_values),
-            'range': np.max(z_values) - np.min(z_values)
+        
+        # Calculate statistics for each axis
+        axes_data = {
+            'X-axis': x_values,
+            'Y-axis': y_values,
+            'Z-axis': z_values
         }
         
-        # Create statistics table
+        all_stats = {}
+        for axis_name, values in axes_data.items():
+            stats = {
+                'count': len(values),
+                'mean': np.mean(values),
+                'median': np.median(values),
+                'min': np.min(values),
+                'max': np.max(values),
+                'std': np.std(values),
+                'range': np.max(values) - np.min(values)
+            }
+            all_stats[axis_name] = stats
+        
+        # Create statistics table with all three axes
         self.stats_table = QTableWidget()
-        self.stats_table.setColumnCount(2)
-        self.stats_table.setHorizontalHeaderLabels(["Statistic", "Value"])
-        self.stats_table.setRowCount(len(stats))
+        self.stats_table.setColumnCount(4)  # Statistic name + 3 axes
+        self.stats_table.setHorizontalHeaderLabels(["Statistic", "X-axis", "Y-axis", "Z-axis"])
+        self.stats_table.setRowCount(7)  # 7 statistics
+        
+        # Statistics labels
+        stat_labels = ['Count', 'Mean', 'Median', 'Min', 'Max', 'Std Dev', 'Range']
+        stat_keys = ['count', 'mean', 'median', 'min', 'max', 'std', 'range']
         
         # Add statistics to table
-        for i, (key, value) in enumerate(stats.items()):
-            self.stats_table.setItem(i, 0, QTableWidgetItem(key.capitalize()))
-            self.stats_table.setItem(i, 1, QTableWidgetItem(f"{value:.3f}"))
+        for i, (label, key) in enumerate(zip(stat_labels, stat_keys)):
+            self.stats_table.setItem(i, 0, QTableWidgetItem(label))
+            
+            # Add values for each axis
+            for j, axis_name in enumerate(['X-axis', 'Y-axis', 'Z-axis']):
+                value = all_stats[axis_name][key]
+                if key == 'count':
+                    self.stats_table.setItem(i, j+1, QTableWidgetItem(f"{int(value):,}"))
+                else:
+                    self.stats_table.setItem(i, j+1, QTableWidgetItem(f"{value:.3f}"))
         
-        # Add to a new tab
+        # Add to statistics tab (create if doesn't exist)
         if not hasattr(self, 'stats_tab'):
             self.stats_tab = QWidget()
             self.results_tabs.addTab(self.stats_tab, "Statistics")
             stats_layout = QVBoxLayout(self.stats_tab)
             
             # Add description label
-            desc_label = QLabel("Statistics of Z-axis measurements:")
-            desc_label.setStyleSheet("font-weight: bold;")
+            desc_label = QLabel("Point Cloud Statistics:")
+            desc_label.setStyleSheet("font-weight: bold; font-size: 12px;")
             stats_layout.addWidget(desc_label)
+            
+            # Add summary info
+            self.summary_label = QLabel()
+            self.summary_label.setStyleSheet("font-size: 11px; color: #666; margin: 10px 0;")
+            stats_layout.addWidget(self.summary_label)
+            
+            stats_layout.addWidget(self.stats_table)
+
+        else:
+            # Update existing table
+            stats_layout = self.stats_tab.layout()
+            # Clear and recreate the table
+            for i in reversed(range(stats_layout.count())):
+                child = stats_layout.itemAt(i).widget()
+                if isinstance(child, QTableWidget):
+                    child.setParent(None)
             stats_layout.addWidget(self.stats_table)
         
+        # Update summary info
+        total_points = len(self.points)
+        x_range = all_stats['X-axis']['range']
+        y_range = all_stats['Y-axis']['range']
+        z_range = all_stats['Z-axis']['range']
+        
+        # Determine which axis has the largest range (likely the main cylinder axis)
+        ranges = [x_range, y_range, z_range]
+        main_axis = ['X', 'Y', 'Z'][ranges.index(max(ranges))]
+        
+        summary_text = (
+            f"Total Points: {total_points:,} | "
+            f"X Range: {x_range:.3f}m | "
+            f"Y Range: {y_range:.3f}m | "
+            f"Z Range: {z_range:.3f}m | "
+            f"Main Axis: {main_axis}"
+        )
+        
+        if hasattr(self, 'summary_label'):
+            self.summary_label.setText(summary_text)
+        
+        # Auto-resize columns
         self.stats_table.resizeColumnsToContents()
         
         # Show statistics in status bar
         self.statusBar().showMessage(
-            f"Mean Z: {stats['mean']:.3f}, Range: {stats['range']:.3f}, "
-            f"Std Dev: {stats['std']:.3f}"
+            f"Points: {total_points:,} | Main axis: {main_axis} | "
+            f"{main_axis} range: {max(ranges):.3f}m"
         )
 
     # Add this method to the CylinderAnalyzerGUI class
@@ -632,25 +713,28 @@ class CylinderAnalyzerGUI(QMainWindow):
             return
             
         z_target = self.z_slice_input.value()
-        slice_thickness = self.slice_thickness.value()  # Get slice thickness
+        slice_thickness = self.viz_slice_thickness.value()  # Use visualization thickness
         dz = slice_thickness / 2.0
         
         # Get slice points
         mask = (self.points[:, 2] >= z_target - dz) & (self.points[:, 2] <= z_target + dz)
         slice_points = self.points[mask]
         
-        if len(slice_points) < 1000:
-            self.statusBar().showMessage(f"Too few points ({len(slice_points)}) in slice")
+        # Show point count info
+        self.statusBar().showMessage(f"Found {len(slice_points)} points in slice (thickness: {slice_thickness:.3f}m)")
+        
+        if len(slice_points) < 100:  # Lower threshold since we're just visualizing
+            self.statusBar().showMessage(f"Too few points ({len(slice_points)}) in slice - try increasing thickness")
             return
             
-        # Configure parameters
+        # Configure parameters with visualization thickness
         params = {
-            'window_len': slice_thickness,  # Use slice thickness for window
+            'window_len': slice_thickness,  # Use visualization thickness
             'z_step': self.z_step.value(),
             'boundary_method': self.boundary_method.currentText(),
             'angle_bins': self.angle_bins.value(),
             'max_points_for_speed': 1_000_000,
-            'min_points_per_slice': 1000,
+            'min_points_per_slice': 100,  # Lower threshold for visualization
             'inlier_quantile': 0.80
         }
         
@@ -659,16 +743,81 @@ class CylinderAnalyzerGUI(QMainWindow):
             analyzer = CylinderAnalyzer(Config(**params))
             result = analyzer.process_slice(slice_points, z_target)
             
+            # Check if result is None first
             if result is None:
-                self.statusBar().showMessage("Could not process slice")
+                self.statusBar().showMessage("Could not process slice - try adjusting parameters or increasing thickness")
                 return
-                
-            # Unpack results (handle both tuple formats)
-            if len(result) == 5:
-                result_dict, edge_xy, _, (xc, yc, R), ov = result
-            else:
-                result_dict, edge_xy, (xc, yc, R) = result
-                ov = result_dict.get('ovality_pct', 0)
+            
+            # Debug: print detailed result structure
+            print(f"Debug - Result type: {type(result)}, Length: {len(result) if hasattr(result, '__len__') else 'N/A'}")
+            
+            # Initialize default values
+            xc = yc = R = 0.0
+            edge_xy = None
+            ovality_pct = 0.0
+            result_dict = None
+            
+            # Handle the actual result format based on debug output
+            try:
+                if isinstance(result, tuple) and len(result) == 3:
+                    # Format: (inner_tuple, dataframe, None)
+                    inner_tuple, df, _ = result
+                    
+                    print(f"Debug - Inner tuple length: {len(inner_tuple)}")
+                    
+                    if isinstance(inner_tuple, tuple) and len(inner_tuple) >= 4:
+                        # Expected format: (result_dict, edge_array, boundary_array, (cx, cy, R), ovality_dict)
+                        if len(inner_tuple) == 5:
+                            result_dict, edge_xy, _, circle_params, ovality_dict = inner_tuple
+                        elif len(inner_tuple) == 4:
+                            result_dict, edge_xy, _, circle_params = inner_tuple
+                            ovality_dict = {}
+                        else:
+                            # Try to get the last 2 elements as circle_params and ovality
+                            result_dict = inner_tuple[0]
+                            edge_xy = inner_tuple[1] if isinstance(inner_tuple[1], np.ndarray) else None
+                            circle_params = inner_tuple[-2] if len(inner_tuple) >= 2 else None
+                            ovality_dict = inner_tuple[-1] if len(inner_tuple) >= 1 else {}
+                        
+                        # Extract circle parameters
+                        if isinstance(circle_params, tuple) and len(circle_params) == 3:
+                            xc, yc, R = circle_params
+                            print(f"Debug - Circle params: cx={xc}, cy={yc}, R={R}")
+                        else:
+                            # Try to get from result_dict
+                            if isinstance(result_dict, dict):
+                                xc = result_dict.get('cx', 0.0)
+                                yc = result_dict.get('cy', 0.0) 
+                                R = result_dict.get('R', 0.0)
+                                print(f"Debug - Circle params from dict: cx={xc}, cy={yc}, R={R}")
+                            else:
+                                raise ValueError("Cannot extract circle parameters")
+                        
+                        # Extract ovality
+                        if isinstance(ovality_dict, dict):
+                            ovality_pct = ovality_dict.get('ovality_pct', 0.0)
+                        elif isinstance(result_dict, dict):
+                            ovality_pct = result_dict.get('ovality_pct', 0.0)
+                        else:
+                            ovality_pct = 0.0
+                            
+                    else:
+                        raise ValueError(f"Inner tuple has unexpected length: {len(inner_tuple)}")
+                        
+                else:
+                    raise ValueError(f"Unexpected result format with {len(result) if hasattr(result, '__len__') else 0} elements")
+                    
+            except Exception as parse_error:
+                print(f"Debug - Error parsing result: {parse_error}")
+                self.statusBar().showMessage(f"Error parsing analysis result: {str(parse_error)}")
+                return
+        
+            # Validate extracted values
+            if R <= 0:
+                self.statusBar().showMessage("Invalid radius calculated - try adjusting parameters")
+                return
+        
+            print(f"Debug - Final values: xc={xc}, yc={yc}, R={R}, ovality={ovality_pct}")
         
             # Clear previous plot
             self.slice_figure.clear()
@@ -683,38 +832,43 @@ class CylinderAnalyzerGUI(QMainWindow):
             
             # Plot points, boundary and fitted circle
             ax.scatter(plot_points[:, 0], plot_points[:, 1], 
-                      s=1, alpha=0.3, label='Points')
-            if edge_xy is not None:
+                    s=1, alpha=0.3, label='Points', c='lightblue')
+            
+            if edge_xy is not None and len(edge_xy) > 0:
                 ax.plot(edge_xy[:, 0], edge_xy[:, 1], 'k-', 
-                       linewidth=1, label='Boundary')
+                    linewidth=1.5, label='Boundary')
             
             # Plot fitted circle
             theta = np.linspace(0, 2*np.pi, 360)
             circle_x = xc + R*np.cos(theta)
             circle_y = yc + R*np.sin(theta)
             ax.plot(circle_x, circle_y, 'r-', 
-                   linewidth=2, label='Fitted Circle')
+                linewidth=2, label='Fitted Circle')
             
             # Plot center
-            ax.plot(xc, yc, 'r+', markersize=10, label='Center')
+            ax.plot(xc, yc, 'r+', markersize=12, markeredgewidth=3, label='Center')
             
             # Add text with parameters (in meters)
             info_text = (
                 f"Z = {z_target:.4f} ± {dz:.4f} m\n"
-                f"Points: {len(slice_points)}\n"
+                f"Points: {len(slice_points):,}\n"
+                f"Edge Points: {len(edge_xy) if edge_xy is not None else 0}\n"
                 f"Center: ({xc:.4f}, {yc:.4f}) m\n"
                 f"Radius: {R:.4f} m\n"
-                f"Ovality: {ov:.3f}%"
+                f"Ovality: {ovality_pct:.3f}%\n"
+                f"Viz Thickness: {slice_thickness:.3f} m"
             )
             ax.text(0.02, 0.98, info_text,
-                   transform=ax.transAxes,
-                   verticalalignment='top',
-                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                transform=ax.transAxes,
+                verticalalignment='top',
+                fontsize=9,
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
             
             ax.set_aspect('equal')
-            ax.grid(True)
+            ax.grid(True, alpha=0.3)
             ax.set_xlabel('X (m)')
             ax.set_ylabel('Y (m)')
+            ax.set_title(f'Slice Visualization at Z = {z_target:.4f}m (±{dz:.4f}m)')
             
             # Adjust layout before adding legend
             self.slice_figure.tight_layout()
@@ -730,11 +884,20 @@ class CylinderAnalyzerGUI(QMainWindow):
             # Switch to slice tab
             self.results_tabs.setCurrentIndex(2)
             
-            self.statusBar().showMessage("Slice visualization complete")
+            self.statusBar().showMessage(f"Slice visualization complete - {len(slice_points):,} points, thickness: {slice_thickness:.3f}m")
             
         except Exception as e:
-            self.statusBar().showMessage(f"Error visualizing slice: {str(e)}")
-
+            error_msg = str(e)
+            print(f"Debug - Full error in visualize_slice: {error_msg}")
+            print(f"Debug - Error type: {type(e)}")
+            
+            # More specific error messages
+            if "cannot unpack" in error_msg:
+                self.statusBar().showMessage("Analysis failed - try increasing slice thickness or adjusting parameters")
+            elif "process_slice" in error_msg:
+                self.statusBar().showMessage("Slice processing failed - check data quality and parameters")
+            else:
+                self.statusBar().showMessage(f"Error: {error_msg} - try increasing thickness")
     def visualize_circular_slices(self):
         """Visualize circular slices in 3D VTK view based on analysis results"""
         if not hasattr(self, 'current_results') or not self.current_results:
