@@ -439,15 +439,183 @@ class CylinderAnalyzerGUI(QMainWindow):
             self.export_btn.setEnabled(True)
             self.display_results(self.current_results)
             
-            # Automatically visualize slices if checkbox is checked
+            # Auto-visualize all slices in Plots tab
+            self.visualize_all_slices_in_plots()
+            
+            # Automatically visualize 3D slices if checkbox is checked
             if self.auto_visualize.isChecked():
                 self.visualize_circular_slices()
-                self.statusBar().showMessage(f"Analysis completed - {len(self.current_results)} slices visualized")
+                self.statusBar().showMessage(f"Analysis completed - {len(self.current_results)} slices visualized in both 2D and 3D")
             else:
-                self.statusBar().showMessage("Analysis completed successfully")
+                self.statusBar().showMessage(f"Analysis completed - {len(self.current_results)} slices visualized in 2D plots")
         else:
             self.statusBar().showMessage("Analysis failed")
-    
+
+    def visualize_all_slices_in_plots(self):
+        """Visualize all analyzed slices in the Plots tab"""
+        if not hasattr(self, 'current_results') or not self.current_results:
+            return
+        
+        # Clear previous plots
+        self.figure.clear()
+        
+        # Get thickness for visualization - Use analysis slice thickness, not viz thickness
+        slice_thickness = self.slice_thickness.value()
+        
+        # Determine grid layout based on number of slices - REMOVED 16 plot limit
+        num_slices = len(self.current_results)
+        if num_slices <= 4:
+            rows, cols = 2, 2
+        elif num_slices <= 6:
+            rows, cols = 2, 3
+        elif num_slices <= 9:
+            rows, cols = 3, 3
+        elif num_slices <= 12:
+            rows, cols = 3, 4
+        elif num_slices <= 16:
+            rows, cols = 4, 4
+        elif num_slices <= 20:
+            rows, cols = 4, 5
+        elif num_slices <= 25:
+            rows, cols = 5, 5
+        elif num_slices <= 30:
+            rows, cols = 5, 6
+        elif num_slices <= 36:
+            rows, cols = 6, 6
+        else:
+            # For very large numbers, use square root to get reasonable grid
+            import math
+            cols = math.ceil(math.sqrt(num_slices))
+            rows = math.ceil(num_slices / cols)
+            
+        # Display ALL plots - REMOVED max_plots limitation
+        max_plots = num_slices  # Show all slices
+        
+        # Increase figure size for more plots
+        if num_slices > 16:
+            self.figure.set_size_inches(12, 10)  # Larger figure for more plots
+        
+        self.statusBar().showMessage(f"Visualizing {max_plots} slices...")
+        
+        # Create subplots for each slice
+        for i, result in enumerate(self.current_results[:max_plots]):
+            ax = self.figure.add_subplot(rows, cols, i + 1)
+            
+            try:
+                # Get slice data
+                z_target = result['z_center']
+                cx = result['cx']
+                cy = result['cy']
+                radius = result['R']
+                ovality_pct = result.get('ovality_pct', 0.0)
+                
+                dz = slice_thickness / 2.0
+                
+                # Get slice points
+                mask = (self.points[:, 2] >= z_target - dz) & (self.points[:, 2] <= z_target + dz)
+                slice_points = self.points[mask]
+                
+                if len(slice_points) < 50:  # Skip if too few points
+                    ax.text(0.5, 0.5, f'Too few points\n({len(slice_points)})', 
+                        ha='center', va='center', transform=ax.transAxes)
+                    ax.set_title(f'Z={z_target:.2f}m')
+                    continue
+                
+                # Subsample points for faster plotting - reduce for many plots
+                max_points = 3000 if num_slices > 20 else 5000
+                if len(slice_points) > max_points:
+                    idx = np.random.choice(len(slice_points), max_points, replace=False)
+                    plot_points = slice_points[idx]
+                else:
+                    plot_points = slice_points
+                
+                # Plot points - smaller points for many plots
+                point_size = 0.3 if num_slices > 20 else 0.5
+                ax.scatter(plot_points[:, 0], plot_points[:, 1], 
+                        s=point_size, alpha=0.4, c='lightblue', rasterized=True)
+                
+                # Try to get and plot boundary if available
+                try:
+                    # Re-analyze this slice to get boundary - Use analysis parameters
+                    params = {
+                        'window_len': slice_thickness,
+                        'z_step': self.z_step.value(),
+                        'boundary_method': self.boundary_method.currentText(),
+                        'angle_bins': self.angle_bins.value(),
+                        'max_points_for_speed': 1_000_000,
+                        'min_points_per_slice': 50,
+                        'inlier_quantile': 0.80
+                    }
+                    
+                    analyzer = CylinderAnalyzer(Config(**params))
+                    slice_result = analyzer.process_slice(slice_points, z_target)
+                    
+                    if slice_result and len(slice_result) >= 3:
+                        inner_tuple = slice_result[0]
+                        if isinstance(inner_tuple, tuple) and len(inner_tuple) >= 2:
+                            edge_xy = inner_tuple[1]
+                            if edge_xy is not None and len(edge_xy) > 0:
+                                line_width = 0.8 if num_slices > 20 else 1.0
+                                ax.plot(edge_xy[:, 0], edge_xy[:, 1], 'k-', 
+                                    linewidth=line_width, alpha=0.8)
+                except:
+                    pass  # Skip boundary if failed
+                
+                # Plot fitted circle
+                theta = np.linspace(0, 2*np.pi, 360)
+                circle_x = cx + radius * np.cos(theta)
+                circle_y = cy + radius * np.sin(theta)
+                circle_width = 1.0 if num_slices > 20 else 1.5
+                ax.plot(circle_x, circle_y, 'r-', linewidth=circle_width, alpha=0.9)
+                
+                # Plot center
+                marker_size = 6 if num_slices > 20 else 8
+                ax.plot(cx, cy, 'r+', markersize=marker_size, markeredgewidth=2)
+                
+                # Set equal aspect and limits
+                ax.set_aspect('equal')
+                
+                # Set title with key information - smaller font for many plots
+                title_fontsize = 6 if num_slices > 25 else 8
+                ax.set_title(f'Z={z_target:.2f}m\nR={radius:.3f}m, O={ovality_pct:.1f}%', 
+                            fontsize=title_fontsize)
+                
+                # Minimal axis labels for space - only for bottom and left edges
+                label_fontsize = 6 if num_slices > 25 else 8
+                if i >= num_slices - cols:  # Bottom row
+                    ax.set_xlabel('X (m)', fontsize=label_fontsize)
+                if i % cols == 0:  # Left column
+                    ax.set_ylabel('Y (m)', fontsize=label_fontsize)
+                    
+                # Smaller tick labels
+                tick_fontsize = 5 if num_slices > 25 else 7
+                ax.tick_params(labelsize=tick_fontsize)
+                
+                # Add grid
+                ax.grid(True, alpha=0.2 if num_slices > 20 else 0.3)
+                
+            except Exception as e:
+                # If individual slice fails, show error
+                ax.text(0.5, 0.5, f'Error:\n{str(e)[:20]}...', 
+                    ha='center', va='center', transform=ax.transAxes, fontsize=6)
+                ax.set_title(f'Z={result["z_center"]:.2f}m - Error', fontsize=6)
+        
+        # Adjust layout - Show analysis thickness in title
+        title_fontsize = 10 if num_slices > 25 else 12
+        self.figure.suptitle(f'All Analyzed Slices (Analysis Thickness: {slice_thickness:.3f}m)', 
+                            fontsize=title_fontsize)
+        
+        # Tighter layout for many plots
+        if num_slices > 16:
+            self.figure.tight_layout(pad=0.5, h_pad=0.5, w_pad=0.5)
+        else:
+            self.figure.tight_layout()
+        
+        # Draw and switch to plots tab
+        self.canvas.draw()
+        self.results_tabs.setCurrentIndex(1)  # Switch to Plots tab
+        
+        self.statusBar().showMessage(f"All {max_plots} slices visualized in Plots tab (Thickness: {slice_thickness:.3f}m)")
     def display_results(self, results):
         # Update table with all columns
         headers = [
@@ -1008,6 +1176,7 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.vtk_widget_slices.GetRenderWindow().Render()
         
         self.statusBar().showMessage(f"Visualized {len(self.current_results)} slices along {['X','Y','Z'][main_axis]} axis")
+
     def compare_years(self):
         # Select CSV files for comparison
         filenames, _ = QFileDialog.getOpenFileNames(
@@ -1021,6 +1190,17 @@ class CylinderAnalyzerGUI(QMainWindow):
             return
             
         try:
+            # Create separate tab for comparison if not exists
+            if not hasattr(self, 'comparison_tab'):
+                self.comparison_tab = QWidget()
+                self.results_tabs.addTab(self.comparison_tab, "Year Comparison")
+                comparison_layout = QVBoxLayout(self.comparison_tab)
+                
+                # Create separate figure for comparison
+                self.comparison_figure = plt.figure(figsize=(10, 8))
+                self.comparison_canvas = FigureCanvasQTAgg(self.comparison_figure)
+                comparison_layout.addWidget(self.comparison_canvas)
+            
             # Load and combine data
             all_data = []
             for filename in filenames:
@@ -1035,11 +1215,11 @@ class CylinderAnalyzerGUI(QMainWindow):
             # Combine all dataframes
             combined_df = pd.concat(all_data, ignore_index=True)
             
-            # Create comparison plots
-            self.figure.clear()
+            # Clear comparison plots
+            self.comparison_figure.clear()
             
             # Plot 1: Ovality vs Z for different years
-            ax1 = self.figure.add_subplot(211)
+            ax1 = self.comparison_figure.add_subplot(211)
             for year in combined_df['Year'].unique():
                 year_data = combined_df[combined_df['Year'] == year]
                 ax1.plot(year_data['z_center'], year_data['ovality_pct'], 
@@ -1052,7 +1232,7 @@ class CylinderAnalyzerGUI(QMainWindow):
             ax1.set_title('Ovality Comparison')
             
             # Plot 2: Radius vs Z for different years
-            ax2 = self.figure.add_subplot(212)
+            ax2 = self.comparison_figure.add_subplot(212)
             for year in combined_df['Year'].unique():
                 year_data = combined_df[combined_df['Year'] == year]
                 ax2.plot(year_data['z_center'], year_data['R'], 
@@ -1064,11 +1244,12 @@ class CylinderAnalyzerGUI(QMainWindow):
             ax2.legend()
             ax2.set_title('Radius Comparison')
             
-            self.figure.tight_layout()
-            self.canvas.draw()
+            self.comparison_figure.tight_layout()
+            self.comparison_canvas.draw()
             
-            # Switch to plots tab
-            self.results_tabs.setCurrentIndex(1)
+            # Switch to comparison tab
+            comparison_tab_index = self.results_tabs.indexOf(self.comparison_tab)
+            self.results_tabs.setCurrentIndex(comparison_tab_index)
             
             # Create comparison statistics
             stats_text = "Comparison Statistics:\n\n"
