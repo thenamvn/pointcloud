@@ -77,7 +77,7 @@ class CylinderAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Cylinder Analyzer")
-        self.setMinimumSize(1400, 800)
+        self.setMinimumSize(1200, 800)
         
         # Main widget and layout
         main_widget = QWidget()
@@ -225,62 +225,30 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.slice_canvas = FigureCanvasQTAgg(self.slice_figure)
         slice_tab_layout.addWidget(self.slice_canvas)
         
-        # Create splitter for VTK views and results
+        # Add widgets to main layout using QSplitter
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         
-        # Create horizontal splitter for two VTK views
-        vtk_splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        # Left VTK widget for original point cloud
-        self.vtk_widget_original = QVTKRenderWindowInteractor()
-        self.renderer_original = vtk.vtkRenderer()
-        self.vtk_widget_original.GetRenderWindow().AddRenderer(self.renderer_original)
-        self.renderer_original.SetBackground(0.1, 0.1, 0.1)
-        
-        # Right VTK widget for slice visualization
-        self.vtk_widget_slices = QVTKRenderWindowInteractor()
-        self.renderer_slices = vtk.vtkRenderer()
-        self.vtk_widget_slices.GetRenderWindow().AddRenderer(self.renderer_slices)
-        self.renderer_slices.SetBackground(0.1, 0.1, 0.2)
-        
-        # Add labels for each view
-        original_frame = QWidget()
-        original_layout = QVBoxLayout(original_frame)
-        original_layout.addWidget(QLabel("Original Point Cloud"))
-        original_layout.addWidget(self.vtk_widget_original)
-        
-        slices_frame = QWidget()
-        slices_layout = QVBoxLayout(slices_frame)
-        slices_layout.addWidget(QLabel("Reconstructed Slices"))
-        slices_layout.addWidget(self.vtk_widget_slices)
-        
-        vtk_splitter.addWidget(original_frame)
-        vtk_splitter.addWidget(slices_frame)
-        vtk_splitter.setSizes([700, 700])  # Equal sizes
-        
-        # Create main vertical splitter
-        self.main_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.main_splitter.addWidget(vtk_splitter)
-        self.main_splitter.addWidget(self.results_tabs)
+        # Create splitter for VTK view and results
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter.addWidget(self.vtk_widget)
+        self.splitter.addWidget(self.results_tabs)
         
         # Set initial sizes (2:1 ratio)
-        self.main_splitter.setSizes([800, 400])
-        self.main_splitter.setStretchFactor(0, 2)
-        self.main_splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([600, 300])
+        self.splitter.setStretchFactor(0, 2)  # VTK widget stretches more
+        self.splitter.setStretchFactor(1, 1)  # Results tabs stretch less
         
-        right_layout.addWidget(self.main_splitter)
+        right_layout.addWidget(self.splitter)
         layout.addWidget(control_panel)
         layout.addWidget(right_panel)
         
         self.points = None
         self.point_cloud_actor = None
         
-        # Initialize VTK interactions
-        self.iren_original = self.vtk_widget_original.GetRenderWindow().GetInteractor()
-        self.iren_slices = self.vtk_widget_slices.GetRenderWindow().GetInteractor()
-        self.iren_original.Initialize()
-        self.iren_slices.Initialize()
+        # Initialize VTK interaction
+        self.iren = self.vtk_widget.GetRenderWindow().GetInteractor()
+        self.iren.Initialize()
         
         # Add progress bar
         self.progress_bar = QProgressBar()
@@ -342,7 +310,7 @@ class CylinderAnalyzerGUI(QMainWindow):
     
     def display_point_cloud(self):
         if self.point_cloud_actor:
-            self.renderer_original.RemoveActor(self.point_cloud_actor)
+            self.renderer.RemoveActor(self.point_cloud_actor)
             
         # Create VTK points
         vtk_points = vtk.vtkPoints()
@@ -366,9 +334,9 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.point_cloud_actor.GetProperty().SetColor(0.5, 0.5, 1.0)
         self.point_cloud_actor.GetProperty().SetPointSize(3)
         
-        self.renderer_original.AddActor(self.point_cloud_actor)
-        self.renderer_original.ResetCamera()
-        self.vtk_widget_original.GetRenderWindow().Render()
+        self.renderer.AddActor(self.point_cloud_actor)
+        self.renderer.ResetCamera()
+        self.vtk_widget.GetRenderWindow().Render()
     
     def analyze_current(self):
         if self.points is None:
@@ -743,28 +711,12 @@ class CylinderAnalyzerGUI(QMainWindow):
         # Clear existing slice actors
         if hasattr(self, 'slice_actors'):
             for actor in self.slice_actors:
-                self.renderer_slices.RemoveActor(actor)
+                self.renderer.RemoveActor(actor)
         
         self.slice_actors = []
         
         # Get slice thickness
         thickness = self.slice_thickness.value()
-        
-        # Determine data orientation
-        if hasattr(self, 'points') and self.points is not None:
-            # Calculate ranges to determine main axis
-            x_range = np.max(self.points[:, 0]) - np.min(self.points[:, 0])
-            y_range = np.max(self.points[:, 1]) - np.min(self.points[:, 1]) 
-            z_range = np.max(self.points[:, 2]) - np.min(self.points[:, 2])
-            
-            print(f"Data ranges - X: {x_range:.3f}, Y: {y_range:.3f}, Z: {z_range:.3f}")
-            
-            # Find main axis (longest dimension)
-            ranges = [x_range, y_range, z_range]
-            main_axis = ranges.index(max(ranges))  # 0=X, 1=Y, 2=Z
-            print(f"Main axis detected: {['X','Y','Z'][main_axis]}")
-        else:
-            main_axis = 1  # Default to Y
         
         # Create circular slices for each result
         for result in self.current_results:
@@ -773,35 +725,22 @@ class CylinderAnalyzerGUI(QMainWindow):
             radius = result['R']
             z_center = result['z_center']
             
-            # Create disk for flat slice
-            disk = vtk.vtkDiskSource()
-            disk.SetInnerRadius(0.0)
-            disk.SetOuterRadius(radius)
-            disk.SetRadialResolution(36)
-            disk.SetCircumferentialResolution(60)
+            # Create cylinder for this slice
+            cylinder = vtk.vtkCylinderSource()
+            cylinder.SetCenter(0, 0, 0)
+            cylinder.SetRadius(radius)
+            cylinder.SetHeight(thickness)
+            cylinder.SetResolution(36)
             
-            # Extrude to create thickness
-            extrude = vtk.vtkLinearExtrusionFilter()
-            extrude.SetInputConnection(disk.GetOutputPort())
-            extrude.SetExtrusionTypeToNormalExtrusion()
-            extrude.SetScaleFactor(thickness)
-            
-            # Transform based on detected main axis
+            # Transform để khớp với dữ liệu thực tế
+            # Dữ liệu: trụ dài theo Y, nên các lát cắt vuông góc với Y
+            # VTK cylinder mặc định dài theo Y, nên cần xoay 90 độ quanh Z
             transform = vtk.vtkTransform()
-            
-            if main_axis == 1:  # Y is main axis - cylinder along Y
-                # Disk is in XY plane by default, need to rotate to XZ plane (perpendicular to Y)
-                transform.RotateX(90)  # Rotate disk to be perpendicular to Y-axis
-                transform.Translate(cx, z_center, cy)
-            elif main_axis == 2:  # Z is main axis - cylinder along Z  
-                # Disk already in XY plane (perpendicular to Z), just translate
-                transform.Translate(cx, cy, z_center)
-            else:  # X is main axis - cylinder along X
-                transform.RotateY(90)  # Rotate disk to be perpendicular to X-axis
-                transform.Translate(z_center, cx, cy)
+            transform.RotateZ(90)  # Xoay để lát cắt vuông góc với trục chính của trụ
+            transform.Translate(cx, z_center, cy)  # Đổi vị trí Y và Z cho khớp
             
             transform_filter = vtk.vtkTransformPolyDataFilter()
-            transform_filter.SetInputConnection(extrude.GetOutputPort())
+            transform_filter.SetInputConnection(cylinder.GetOutputPort())
             transform_filter.SetTransform(transform)
             
             # Create mapper
@@ -812,19 +751,12 @@ class CylinderAnalyzerGUI(QMainWindow):
             actor = vtk.vtkActor()
             actor.SetMapper(mapper)
             
-            # Set color based on position along main axis
-            if main_axis == 1:
-                pos_values = [r['z_center'] for r in self.current_results]
-            elif main_axis == 2:
-                pos_values = [r['z_center'] for r in self.current_results]
-            else:
-                pos_values = [r['z_center'] for r in self.current_results]
-                
-            pos_min = min(pos_values)
-            pos_max = max(pos_values)
+            # Set color based on z position (gradient from blue to red)
+            z_min = min([r['z_center'] for r in self.current_results])
+            z_max = max([r['z_center'] for r in self.current_results])
             
-            if pos_max != pos_min:
-                t = (z_center - pos_min) / (pos_max - pos_min)
+            if z_max != z_min:
+                t = (z_center - z_min) / (z_max - z_min)
             else:
                 t = 0.5
                 
@@ -834,17 +766,16 @@ class CylinderAnalyzerGUI(QMainWindow):
             b = min(1.0, 2.0 * (1.0 - t))
             
             actor.GetProperty().SetColor(r, g, b)
-            actor.GetProperty().SetOpacity(0.6)
+            actor.GetProperty().SetOpacity(0.4)
+            actor.GetProperty().SetRepresentationToWireframe()
             
-            # Add to slice renderer
-            self.renderer_slices.AddActor(actor)
+            # Add to renderer
+            self.renderer.AddActor(actor)
             self.slice_actors.append(actor)
         
         # Update camera and render
-        self.renderer_slices.ResetCamera()
-        self.vtk_widget_slices.GetRenderWindow().Render()
-        
-        self.statusBar().showMessage(f"Visualized {len(self.current_results)} slices along {['X','Y','Z'][main_axis]} axis")
+        self.renderer.ResetCamera()
+        self.vtk_widget.GetRenderWindow().Render()
     def compare_years(self):
         # Select CSV files for comparison
         filenames, _ = QFileDialog.getOpenFileNames(
