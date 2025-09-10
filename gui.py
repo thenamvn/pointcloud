@@ -259,28 +259,18 @@ class CylinderAnalyzerGUI(QMainWindow):
         param_layout.addWidget(self.angle_bins)
 
         quality_group = QWidget()
-        quality_layout = QHBoxLayout(quality_group)
-
-        quality_high_btn = QPushButton("High Quality")
-        quality_high_btn.clicked.connect(lambda: self.set_display_quality('high'))
-        quality_layout.addWidget(quality_high_btn)
-
-        quality_medium_btn = QPushButton("Medium")
-        quality_medium_btn.clicked.connect(lambda: self.set_display_quality('medium'))
-        quality_layout.addWidget(quality_medium_btn)
-
-        quality_fast_btn = QPushButton("Fast")
-        quality_fast_btn.clicked.connect(lambda: self.set_display_quality('fast'))
-        quality_layout.addWidget(quality_fast_btn)
-
+        quality_layout = QVBoxLayout(quality_group)  # Changed to vertical
+        
+        quality_layout.addWidget(QLabel("Display Quality:"))
+        
+        self.quality_dropdown = QComboBox()
+        self.quality_dropdown.addItems(["Ultra High", "High", "Medium", "Fast"])
+        self.quality_dropdown.setCurrentText("Medium")  # Default
+        self.quality_dropdown.currentTextChanged.connect(self.on_quality_changed)
+        quality_layout.addWidget(self.quality_dropdown)
+        
         control_layout.addWidget(quality_group)
-
-        # Initialize with medium quality
         self.display_quality = 'medium'
-
-        # Add display quality controls
-        display_group = QWidget()
-        display_layout = QVBoxLayout(display_group)
 
         # Add checkbox for auto visualization
         self.auto_visualize = QCheckBox("Auto visualize slices after analysis")
@@ -361,12 +351,6 @@ class CylinderAnalyzerGUI(QMainWindow):
         compare_btn = QPushButton("Compare with Other Years")
         compare_btn.clicked.connect(self.compare_years)
         control_layout.addWidget(compare_btn)
-        
-        # # VTK Widget for 3D visualization
-        # self.vtk_widget = QVTKRenderWindowInteractor()
-        # self.renderer = vtk.vtkRenderer()
-        # self.vtk_widget.GetRenderWindow().AddRenderer(self.renderer)
-        # self.renderer.SetBackground(0.1, 0.1, 0.1)
         
         # Add tabs for results
         self.results_tabs = QTabWidget()
@@ -461,6 +445,30 @@ class CylinderAnalyzerGUI(QMainWindow):
         # Add stats display
         self.stats_label = QLabel()
         control_layout.addWidget(self.stats_label)
+
+    def on_quality_changed(self, quality_text):
+        """Handle quality dropdown change"""
+        quality_map = {
+            "Ultra High": "ultra_high",
+            "High": "high", 
+            "Medium": "medium",
+            "Fast": "fast"
+        }
+        
+        self.display_quality = quality_map[quality_text]
+        
+        if hasattr(self, 'points') and self.points is not None:
+            self.display_point_cloud()
+            
+            # Show quality info
+            total_points = len(self.points)
+            display_points = len(self.get_display_points())
+            ratio = (display_points / total_points) * 100
+            
+            self.statusBar().showMessage(
+                f"Display quality: {quality_text} - Showing {display_points:,}/{total_points:,} points ({ratio:.1f}%)"
+            )
+
 
     def update_memory_display(self):
         """Update memory usage display"""
@@ -885,7 +893,7 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.display_quality = quality
         if hasattr(self, 'points') and self.points is not None:
             self.display_point_cloud()
-            
+
     def display_point_cloud(self):
         if self.point_cloud_actor:
             self.renderer_original.RemoveActor(self.point_cloud_actor)
@@ -895,11 +903,16 @@ class CylinderAnalyzerGUI(QMainWindow):
         
         # Get point size from quality setting
         quality_settings = {
-            'high': {'max_points': 500000, 'point_size': 3},
+            'ultra_high': {'max_points': 2000000, 'point_size': 3},
+            'high': {'max_points': 1000000, 'point_size': 3},
             'medium': {'max_points': 200000, 'point_size': 2},
             'fast': {'max_points': 50000, 'point_size': 1}
         }
         point_size = quality_settings[self.display_quality]['point_size']
+        
+        # Show loading message for large datasets
+        if len(display_points) > 500000:
+            self.statusBar().showMessage(f"Rendering {len(display_points):,} points (this may take a moment)...")
         
         # Create VTK points
         vtk_points = vtk.vtkPoints()
@@ -919,21 +932,32 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.point_cloud_actor = vtk.vtkActor()
         self.point_cloud_actor.SetMapper(mapper)
         self.point_cloud_actor.GetProperty().SetColor(0.5, 0.5, 1.0)
-        self.point_cloud_actor.GetProperty().SetPointSize(point_size)  # Use quality-based size
+        self.point_cloud_actor.GetProperty().SetPointSize(point_size)
         
         self.renderer_original.AddActor(self.point_cloud_actor)
         self.renderer_original.ResetCamera()
         self.vtk_widget_original.GetRenderWindow().Render()
+        
+        # Show completion message with details
+        total_points = len(self.points)
+        display_ratio = (len(display_points) / total_points) * 100
+        quality_name = self.quality_dropdown.currentText()
+        
+        self.statusBar().showMessage(
+            f"{quality_name} quality: {len(display_points):,}/{total_points:,} points ({display_ratio:.1f}%) rendered"
+        )
     
     def get_display_points(self):
         """Get subsampled points based on current quality setting"""
         if self.points is None:
             return np.array([])
         
+        # Updated quality settings with Ultra High option
         quality_settings = {
-            'high': {'max_points': 500000, 'point_size': 3},
-            'medium': {'max_points': 200000, 'point_size': 2},
-            'fast': {'max_points': 50000, 'point_size': 1}
+            'ultra_high': {'max_points': 2000000, 'point_size': 3},  # 2M points - much higher
+            'high': {'max_points': 1000000, 'point_size': 3},        # 1M points
+            'medium': {'max_points': 200000, 'point_size': 2},       # 200K points  
+            'fast': {'max_points': 50000, 'point_size': 1}          # 50K points
         }
         
         settings = quality_settings.get(self.display_quality, quality_settings['medium'])
@@ -941,17 +965,37 @@ class CylinderAnalyzerGUI(QMainWindow):
         total_points = len(self.points)
         
         if total_points <= max_points:
+            # If data is smaller than limit, show all points
             return self.points
         
-        # Smart subsampling
+        # Smart subsampling based on ratio
         sample_ratio = max_points / total_points
-        if sample_ratio > 0.7:
+        
+        if sample_ratio > 0.8:  # > 80% - use random sampling
             indices = np.random.choice(total_points, max_points, replace=False)
-        else:
+            return self.points[indices]
+        elif sample_ratio > 0.5:  # 50-80% - mixed sampling for better coverage
+            # Use systematic + random sampling
+            systematic_count = int(max_points * 0.7)
+            random_count = max_points - systematic_count
+            
+            # Systematic sampling
+            step = total_points // systematic_count
+            systematic_indices = np.arange(0, total_points, step)[:systematic_count]
+            
+            # Random sampling from remaining points
+            remaining_indices = np.setdiff1d(np.arange(total_points), systematic_indices)
+            if len(remaining_indices) >= random_count:
+                random_indices = np.random.choice(remaining_indices, random_count, replace=False)
+                all_indices = np.concatenate([systematic_indices, random_indices])
+            else:
+                all_indices = systematic_indices
+                
+            return self.points[all_indices]
+        else:  # < 50% - systematic sampling only
             step = int(1 / sample_ratio)
             indices = np.arange(0, total_points, step)[:max_points]
-        
-        return self.points[indices]
+            return self.points[indices]
         
     def analyze_current(self):
         if self.points is None:
