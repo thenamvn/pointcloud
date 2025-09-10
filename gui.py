@@ -73,6 +73,103 @@ class LoadPointCloudWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+class LoadMultiplePointCloudWorker(QThread):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(tuple)
+    error = pyqtSignal(str)
+    
+    def __init__(self, filenames):
+        super().__init__()
+        self.filenames = filenames
+        
+    def run(self):
+        try:
+            all_points = []
+            total_files = len(self.filenames)
+            
+            for file_idx, filename in enumerate(self.filenames):
+                self.progress.emit(int((file_idx / total_files) * 90))
+                
+                try:
+                    # Parse each file
+                    file_points = self.parse_file(filename)
+                    
+                    if len(file_points) == 0:
+                        print(f"Warning: No valid points found in {filename}")
+                        continue
+                        
+                    all_points.extend(file_points)
+                    print(f"Loaded {len(file_points):,} points from {os.path.basename(filename)}")
+                    
+                except Exception as e:
+                    self.error.emit(f"Error reading {filename}: {str(e)}")
+                    return
+            
+            self.progress.emit(95)
+            
+            if len(all_points) == 0:
+                self.error.emit("No points loaded from any file")
+                return
+                
+            # Convert to numpy array
+            points = np.array(all_points, dtype=np.float64)
+            
+            # Validate and clean data
+            if points.shape[1] < 3:
+                self.error.emit("Points must have at least 3 coordinates (X, Y, Z)")
+                return
+                
+            # Take only first 3 columns and remove invalid points
+            points = points[:, :3]
+            valid_mask = np.all(np.isfinite(points), axis=1)
+            points = points[valid_mask]
+            
+            if len(points) == 0:
+                self.error.emit("No valid points after filtering")
+                return
+            
+            self.progress.emit(100)
+            self.finished.emit((points, len(points)))
+            
+        except Exception as e:
+            self.error.emit(f"Unexpected error: {str(e)}")
+    
+    def parse_file(self, filename):
+        """Parse single file - handles TXT, CSV, XYZ formats"""
+        points = []
+        
+        try:
+            # Try pandas for CSV files first
+            if filename.lower().endswith('.csv'):
+                import pandas as pd
+                df = pd.read_csv(filename)
+                if len(df.columns) >= 3:
+                    return df.iloc[:, :3].values.tolist()
+        except:
+            pass
+        
+        # Manual parsing for text files
+        with open(filename, 'r') as f:
+            for line_num, line in enumerate(f):
+                line = line.strip()
+                
+                # Skip empty lines and comments
+                if not line or line.startswith('#') or line.startswith('//'):
+                    continue
+                
+                try:
+                    # Handle different separators
+                    line = line.replace(',', ' ').replace(';', ' ').replace('\t', ' ')
+                    coords = [float(x) for x in line.split() if x]
+                    
+                    if len(coords) >= 3:
+                        points.append(coords[:3])
+                        
+                except ValueError:
+                    continue
+        
+        return points
+    
 class CylinderAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -302,26 +399,36 @@ class CylinderAnalyzerGUI(QMainWindow):
         control_layout.addWidget(self.stats_label)
         
     def load_file(self):
-        filename, _ = QFileDialog.getOpenFileName(
+        # Let user select multiple files directly - they can choose single or multiple
+        filenames, _ = QFileDialog.getOpenFileNames(
             self,
-            "Select Point Cloud",
+            "Select Point Cloud File(s) - Choose multiple files to combine them",
             "",
             "Point Cloud Files (*.txt *.csv *.xyz);;All Files (*.*)"
         )
         
-        if filename:
-            # Show progress bar and disable UI
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-            self.setEnabled(False)
-            self.statusBar().showMessage("Loading point cloud...")
+        if filenames:
+            # Auto-detect based on number of files selected
+            if len(filenames) == 1:
+                self.statusBar().showMessage(f"Loading single file: {os.path.basename(filenames[0])}...")
+            else:
+                self.statusBar().showMessage(f"Loading and combining {len(filenames)} files...")
             
-            # Create and start worker thread
-            self.load_worker = LoadPointCloudWorker(filename)
-            self.load_worker.progress.connect(self.update_progress)
-            self.load_worker.finished.connect(self.load_finished)
-            self.load_worker.error.connect(self.load_error)
-            self.load_worker.start()
+            self.start_loading(filenames)
+
+    def start_loading(self, filenames):
+        """Start loading process for single or multiple files"""
+        # Show progress bar and disable UI
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.setEnabled(False)
+        
+        # Create and start worker thread for multiple files
+        self.load_worker = LoadMultiplePointCloudWorker(filenames)
+        self.load_worker.progress.connect(self.update_progress)
+        self.load_worker.finished.connect(self.load_finished)
+        self.load_worker.error.connect(self.load_error)
+        self.load_worker.start()
 
     def load_finished(self, result):
         points, num_points = result
@@ -333,26 +440,32 @@ class CylinderAnalyzerGUI(QMainWindow):
         
         # Set Z spinbox range and initial value
         self.z_slice_input.setRange(z_min, z_max)
-        self.z_slice_input.setValue(z_min + (z_max - z_min)/2)  # Set to middle
-        self.z_slice_input.setSingleStep((z_max - z_min)/50)  # Reasonable step size
+        self.z_slice_input.setValue(z_min + (z_range := z_max - z_min)/2)
+        self.z_slice_input.setSingleStep(z_range/50)
 
         # Set reasonable default thickness based on data range
-        z_range = z_max - z_min
-        default_thickness = max(0.5, z_range / 50)  # At least 0.5m or 1/50 of total range
+        default_thickness = max(0.5, z_range / 50)
         self.viz_slice_thickness.setValue(default_thickness)
 
-        # Enable Z slice controls
+        # Enable controls
         self.z_slice_input.setEnabled(True)
         self.show_slice_btn.setEnabled(True)
         self.viz_slice_thickness.setEnabled(True)
         
         self.display_point_cloud()
-
         self.show_statistics()
-
         self.progress_bar.setVisible(False)
         self.setEnabled(True)
-        self.statusBar().showMessage(f"Loaded {num_points} points")
+        
+        # Show appropriate message based on number of files loaded
+        if hasattr(self.load_worker, 'filenames'):
+            file_count = len(self.load_worker.filenames)
+            if file_count == 1:
+                self.statusBar().showMessage(f"Loaded {num_points:,} points")
+            else:
+                self.statusBar().showMessage(f"Combined {num_points:,} points from {file_count} files")
+        else:
+            self.statusBar().showMessage(f"Loaded {num_points:,} points")
 
     def load_error(self, error_msg):
         self.progress_bar.setVisible(False)
