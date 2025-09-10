@@ -8,7 +8,6 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 import vtk
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from analyzer import CylinderAnalyzer, Config
-from utils.data_io import load_txt_points
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import pandas as pd
@@ -339,11 +338,11 @@ class CylinderAnalyzerGUI(QMainWindow):
         compare_btn.clicked.connect(self.compare_years)
         control_layout.addWidget(compare_btn)
         
-        # VTK Widget for 3D visualization
-        self.vtk_widget = QVTKRenderWindowInteractor()
-        self.renderer = vtk.vtkRenderer()
-        self.vtk_widget.GetRenderWindow().AddRenderer(self.renderer)
-        self.renderer.SetBackground(0.1, 0.1, 0.1)
+        # # VTK Widget for 3D visualization
+        # self.vtk_widget = QVTKRenderWindowInteractor()
+        # self.renderer = vtk.vtkRenderer()
+        # self.vtk_widget.GetRenderWindow().AddRenderer(self.renderer)
+        # self.renderer.SetBackground(0.1, 0.1, 0.1)
         
         # Add tabs for results
         self.results_tabs = QTabWidget()
@@ -734,20 +733,6 @@ class CylinderAnalyzerGUI(QMainWindow):
         # Clean up
         if hasattr(self, 'files_to_load'):
             del self.files_to_load
-
-    def start_loading(self, filenames):
-        """Start loading process for single file (with append mode)"""
-        # Show progress bar and disable UI
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.setEnabled(False)
-        
-        # Create and start worker thread - use single file worker for incremental loading
-        self.load_worker = LoadPointCloudWorker(filenames[0])
-        self.load_worker.progress.connect(self.update_progress)
-        self.load_worker.finished.connect(self.load_finished)
-        self.load_worker.error.connect(self.load_error)
-        self.load_worker.start()
 
     def load_finished(self, result):
         """Backup method for single file loading (kept for compatibility)"""
@@ -1282,50 +1267,6 @@ class CylinderAnalyzerGUI(QMainWindow):
             f"Points: {total_points:,} | Main axis: {main_axis} | "
             f"{main_axis} range: {max(ranges):.3f}m"
         )
-
-    # Add this method to the CylinderAnalyzerGUI class
-
-    def load_comparison_files(self):
-        filenames, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Select Point Cloud Files for Comparison",
-            "",
-            "Point Cloud Files (*.txt *.csv *.xyz);;All Files (*.*)"
-        )
-        
-        if not filenames:
-            return []
-            
-        comparison_data = []
-        for filename in filenames:
-            try:
-                # Show progress
-                self.statusBar().showMessage(f"Loading {filename}...")
-                self.progress_bar.setVisible(True)
-                self.progress_bar.setValue(0)
-                
-                # Create and run worker for each file
-                worker = LoadPointCloudWorker(filename)
-                worker.progress.connect(self.update_progress)
-                worker.start()
-                worker.wait()  # Wait for completion
-                
-                # Get year from filename (assuming format YYYY_*.txt)
-                try:
-                    year = os.path.basename(filename).split('_')[0]
-                except:
-                    year = os.path.basename(filename)
-                
-                points = np.loadtxt(filename)
-                if points.shape[1] >= 3:  # Ensure we have x,y,z columns
-                    comparison_data.append((year, points))
-                
-            except Exception as e:
-                self.statusBar().showMessage(f"Error loading {filename}: {str(e)}")
-                continue
-                
-        self.progress_bar.setVisible(False)
-        return comparison_data
 
     # Add this method to CylinderAnalyzerGUI class
     def export_results(self):
