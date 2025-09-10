@@ -527,49 +527,213 @@ class CylinderAnalyzerGUI(QMainWindow):
             self.statusBar().showMessage("All data cleared - memory freed")
 
     def load_file(self):
-        # Always allow single file selection for incremental loading
-        filename, _ = QFileDialog.getOpenFileName(
+        # Allow multi-file selection but load incrementally
+        filenames, _ = QFileDialog.getOpenFileNames(
             self,
-            "Select Point Cloud File to Load/Append",
+            "Select Point Cloud File(s) - Multiple files will be loaded incrementally",
             "",
             "Point Cloud Files (*.txt *.csv *.xyz);;All Files (*.*)"
         )
         
-        if filename:
-            # Check if we already have data
-            if hasattr(self, 'points') and self.points is not None:
-                # Ask user if they want to append or replace
-                from PyQt6.QtWidgets import QMessageBox
-                msg = QMessageBox()
-                msg.setIcon(QMessageBox.Icon.Question)
-                msg.setWindowTitle("Data Already Loaded")
-                msg.setText(f"You already have {len(self.points):,} points loaded.")
-                msg.setInformativeText("What would you like to do with the new file?")
-                
-                # Create custom buttons with clear text
-                append_button = msg.addButton("Append to existing data", QMessageBox.ButtonRole.YesRole)
-                replace_button = msg.addButton("Replace existing data", QMessageBox.ButtonRole.NoRole)
-                cancel_button = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-                
-                msg.setDefaultButton(append_button)
-                
-                # Show dialog and get result
-                result = msg.exec()
-                clicked_button = msg.clickedButton()
-                
-                if clicked_button == append_button:
-                    self.append_mode = True
-                    self.statusBar().showMessage(f"Appending {os.path.basename(filename)} to existing data...")
-                elif clicked_button == replace_button:
-                    self.append_mode = False
-                    self.statusBar().showMessage(f"Replacing data with {os.path.basename(filename)}...")
-                else:  # Cancel button or closed dialog
-                    return
-            else:
-                self.append_mode = False
-                self.statusBar().showMessage(f"Loading {os.path.basename(filename)}...")
+        if not filenames:
+            return
+        
+        # Check if we already have data and determine mode
+        if hasattr(self, 'points') and self.points is not None:
+            from PyQt6.QtWidgets import QMessageBox
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Icon.Question)
+            msg.setWindowTitle("Data Already Loaded")
+            msg.setText(f"You already have {len(self.points):,} points loaded.")
+            msg.setInformativeText(f"Selected {len(filenames)} new file(s). What would you like to do?")
             
-            self.start_loading([filename])
+            append_button = msg.addButton("Append all files to existing data", QMessageBox.ButtonRole.YesRole)
+            replace_button = msg.addButton("Replace with new files", QMessageBox.ButtonRole.NoRole)
+            cancel_button = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            
+            msg.setDefaultButton(append_button)
+            result = msg.exec()
+            clicked_button = msg.clickedButton()
+            
+            if clicked_button == append_button:
+                self.append_mode = True
+            elif clicked_button == replace_button:
+                self.append_mode = False
+                # Clear existing data first
+                if hasattr(self, 'points'):
+                    del self.points
+                    self.points = None
+                    import gc
+                    gc.collect()
+            else:
+                return
+        else:
+            self.append_mode = False
+        
+        # Start incremental loading
+        self.start_incremental_loading(filenames)
+
+    def start_incremental_loading(self, filenames):
+        """Load multiple files incrementally to avoid memory overflow"""
+        self.files_to_load = filenames.copy()
+        self.total_files = len(filenames)
+        self.current_file_index = 0
+        self.files_loaded = 0
+        
+        # Show progress bar and disable UI
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.setEnabled(False)
+        
+        # Start loading first file
+        self.load_next_file()
+
+    def load_next_file(self):
+        """Load the next file in the queue"""
+        if self.current_file_index >= len(self.files_to_load):
+            # All files loaded, finish up
+            self.finish_incremental_loading()
+            return
+        
+        current_file = self.files_to_load[self.current_file_index]
+        
+        # Calculate overall progress
+        overall_progress = int((self.current_file_index / self.total_files) * 90)
+        self.progress_bar.setValue(overall_progress)
+        
+        # Show status
+        remaining = self.total_files - self.current_file_index
+        self.statusBar().showMessage(
+            f"Loading file {self.current_file_index + 1}/{self.total_files}: "
+            f"{os.path.basename(current_file)} ({remaining} remaining)"
+        )
+        
+        # Create worker for current file
+        self.current_load_worker = LoadPointCloudWorker(current_file)
+        self.current_load_worker.progress.connect(self.update_file_progress)
+        self.current_load_worker.finished.connect(self.single_file_loaded)
+        self.current_load_worker.error.connect(self.incremental_load_error)
+        self.current_load_worker.start()
+
+    def update_file_progress(self, file_progress):
+        """Update progress for current file loading"""
+        # Combine overall progress with current file progress
+        overall_progress = int((self.current_file_index / self.total_files) * 90)
+        file_contribution = int((file_progress / 100) * (90 / self.total_files))
+        total_progress = overall_progress + file_contribution
+        self.progress_bar.setValue(min(total_progress, 95))
+
+    def single_file_loaded(self, result):
+        """Handle completion of single file loading"""
+        new_points, num_new_points = result
+        
+        try:
+            # Get file info for reporting
+            current_file = self.files_to_load[self.current_file_index]
+            file_memory_mb = new_points.nbytes / (1024*1024)
+            
+            # Combine with existing data if we have any
+            if hasattr(self, 'points') and self.points is not None:
+                # Memory check before combining
+                existing_memory_mb = self.points.nbytes / (1024*1024)
+                total_memory_mb = existing_memory_mb + file_memory_mb
+                
+                # Warning if getting close to memory limit
+                if total_memory_mb > 6000:  # 6GB warning
+                    from PyQt6.QtWidgets import QMessageBox
+                    
+                    remaining_files = self.total_files - self.current_file_index - 1
+                    estimated_total_mb = total_memory_mb * (1 + remaining_files * 0.5)  # Rough estimate
+                    
+                    reply = QMessageBox.warning(
+                        self,
+                        "High Memory Usage Warning",
+                        f"Current memory usage: {total_memory_mb:.0f}MB\n"
+                        f"Estimated final usage: {estimated_total_mb:.0f}MB\n"
+                        f"Remaining files: {remaining_files}\n\n"
+                        f"Continue loading? (You can stop now to avoid memory issues)",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes
+                    )
+                    
+                    if reply == QMessageBox.StandardButton.No:
+                        # Stop loading, finish with current data
+                        self.finish_incremental_loading()
+                        return
+                
+                # Combine data
+                old_count = len(self.points)
+                combined_points = np.vstack([self.points, new_points])
+                
+                # Clear old data to free memory
+                del self.points
+                del new_points
+                import gc
+                gc.collect()
+                
+                self.points = combined_points
+                
+                self.statusBar().showMessage(
+                    f"Added {num_new_points:,} points from {os.path.basename(current_file)}. "
+                    f"Total: {len(self.points):,} points"
+                )
+                
+            else:
+                # First file
+                self.points = new_points
+                self.statusBar().showMessage(f"Loaded {num_new_points:,} points from {os.path.basename(current_file)}")
+            
+            self.files_loaded += 1
+            
+        except MemoryError:
+            self.statusBar().showMessage(f"Memory error loading {os.path.basename(current_file)} - stopping here")
+            self.finish_incremental_loading()
+            return
+        except Exception as e:
+            self.statusBar().showMessage(f"Error combining {os.path.basename(current_file)}: {str(e)}")
+        
+        # Move to next file
+        self.current_file_index += 1
+        
+        # Small delay to allow UI updates and memory cleanup
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(100, self.load_next_file)
+
+    def incremental_load_error(self, error_msg):
+        """Handle error during incremental loading"""
+        current_file = self.files_to_load[self.current_file_index]
+        self.statusBar().showMessage(f"Error loading {os.path.basename(current_file)}: {error_msg}")
+        
+        # Skip this file and continue with next
+        self.current_file_index += 1
+        
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(100, self.load_next_file)
+
+    def finish_incremental_loading(self):
+        """Finish incremental loading process"""
+        # Clean up loading state
+        if hasattr(self, 'current_load_worker'):
+            del self.current_load_worker
+        
+        # Update UI if we have data
+        if hasattr(self, 'points') and self.points is not None:
+            self.update_ui_after_load()
+            
+            # Show final stats
+            final_memory_mb = self.points.nbytes / (1024*1024)
+            self.statusBar().showMessage(
+                f"Incremental loading complete! Loaded {self.files_loaded}/{self.total_files} files. "
+                f"Total: {len(self.points):,} points ({final_memory_mb:.0f}MB)"
+            )
+        else:
+            self.statusBar().showMessage("No data loaded")
+            self.setEnabled(True)
+            self.progress_bar.setVisible(False)
+        
+        # Clean up
+        if hasattr(self, 'files_to_load'):
+            del self.files_to_load
 
     def start_loading(self, filenames):
         """Start loading process for single file (with append mode)"""
@@ -586,14 +750,13 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.load_worker.start()
 
     def load_finished(self, result):
+        """Backup method for single file loading (kept for compatibility)"""
         new_points, num_new_points = result
         
-        # Handle append vs replace mode
+        # Handle append vs replace mode (same logic as before)
         if hasattr(self, 'append_mode') and self.append_mode and hasattr(self, 'points') and self.points is not None:
-            # Append mode: combine with existing data
+            # Append mode logic (same as before)
             old_count = len(self.points)
-            
-            # Check memory before combining
             old_memory_mb = self.points.nbytes / (1024*1024)
             new_memory_mb = new_points.nbytes / (1024*1024)
             total_memory_mb = old_memory_mb + new_memory_mb
@@ -617,13 +780,7 @@ class CylinderAnalyzerGUI(QMainWindow):
                     return
             
             try:
-                # Combine point clouds
-                self.statusBar().showMessage("Combining point clouds...")
-                self.progress_bar.setValue(50)
-                
                 combined_points = np.vstack([self.points, new_points])
-                
-                # Clear old data immediately to free memory
                 del self.points
                 del new_points
                 import gc
@@ -645,7 +802,7 @@ class CylinderAnalyzerGUI(QMainWindow):
                 self.setEnabled(True)
                 return
         else:
-            # Replace mode: clear old data first
+            # Replace mode
             if hasattr(self, 'points') and self.points is not None:
                 del self.points
                 import gc
@@ -654,10 +811,9 @@ class CylinderAnalyzerGUI(QMainWindow):
             self.points = new_points
             self.statusBar().showMessage(f"Loaded {num_new_points:,} points")
         
-        # Update UI ranges and display
+        # Update UI
         self.update_ui_after_load()
         
-        # Show final message
         final_memory_mb = self.points.nbytes / (1024*1024)
         self.statusBar().showMessage(f"Ready - {len(self.points):,} points ({final_memory_mb:.0f}MB)")
 
