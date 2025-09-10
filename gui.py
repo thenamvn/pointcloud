@@ -278,7 +278,29 @@ class CylinderAnalyzerGUI(QMainWindow):
         
         control_layout.addWidget(param_group)
         control_layout.addStretch()
-        
+
+        # Add memory monitor and controls
+        memory_group = QWidget()
+        memory_layout = QVBoxLayout(memory_group)
+
+        # Memory display
+        self.memory_label = QLabel("Memory: 0 MB")
+        memory_layout.addWidget(self.memory_label)
+
+        # Add clear data button
+        clear_btn = QPushButton("Clear All Data")
+        clear_btn.clicked.connect(self.clear_all_data)
+        clear_btn.setStyleSheet("QPushButton { color: red; }")
+        memory_layout.addWidget(clear_btn)
+
+        control_layout.addWidget(memory_group)
+
+        # Memory monitoring timer
+        from PyQt6.QtCore import QTimer
+        self.memory_timer = QTimer()
+        self.memory_timer.timeout.connect(self.update_memory_display)
+        self.memory_timer.start(3000)  # Update every 3 seconds
+
         # Add Z slice visualization controls with range limits
         slice_viz_group = QWidget()
         slice_viz_layout = QVBoxLayout(slice_viz_group)
@@ -416,50 +438,254 @@ class CylinderAnalyzerGUI(QMainWindow):
         # Add stats display
         self.stats_label = QLabel()
         control_layout.addWidget(self.stats_label)
+
+    def update_memory_display(self):
+        """Update memory usage display"""
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_mb = process.memory_info().rss / (1024 * 1024)
+            
+            if hasattr(self, 'points') and self.points is not None:
+                points_mb = self.points.nbytes / (1024 * 1024)
+                self.memory_label.setText(f"RAM: {memory_mb:.0f}MB (Points: {points_mb:.0f}MB)")
+                
+                # Color coding
+                if memory_mb > 6000:  # 6GB - red
+                    self.memory_label.setStyleSheet("color: red; font-weight: bold;")
+                elif memory_mb > 4000:  # 4GB - orange
+                    self.memory_label.setStyleSheet("color: orange; font-weight: bold;")
+                elif memory_mb > 2000:  # 2GB - yellow
+                    self.memory_label.setStyleSheet("color: #FF8C00; font-weight: bold;")
+                else:  # < 2GB - green
+                    self.memory_label.setStyleSheet("color: green;")
+            else:
+                self.memory_label.setText(f"RAM: {memory_mb:.0f}MB (No data)")
+                self.memory_label.setStyleSheet("color: gray;")
+                
+        except ImportError:
+            self.memory_label.setText("RAM: psutil not available")
+        except Exception:
+            pass
+
+    def clear_all_data(self):
+        """Clear all loaded data to free memory"""
+        from PyQt6.QtWidgets import QMessageBox
         
-    def load_file(self):
-        # Let user select multiple files directly - they can choose single or multiple
-        filenames, _ = QFileDialog.getOpenFileNames(
+        if not hasattr(self, 'points') or self.points is None:
+            self.statusBar().showMessage("No data to clear")
+            return
+        
+        reply = QMessageBox.question(
             self,
-            "Select Point Cloud File(s) - Choose multiple files to combine them",
+            "Clear All Data",
+            f"Are you sure you want to clear {len(self.points):,} points?\n"
+            f"This will free up memory but you'll lose all current data.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            # Clear all data
+            if hasattr(self, 'points'):
+                del self.points
+                self.points = None
+            
+            if hasattr(self, 'current_results'):
+                del self.current_results
+            
+            # Clear VTK actors
+            if hasattr(self, 'point_cloud_actor') and self.point_cloud_actor:
+                self.renderer_original.RemoveActor(self.point_cloud_actor)
+                self.point_cloud_actor = None
+            
+            if hasattr(self, 'slice_actors'):
+                for actor in self.slice_actors:
+                    self.renderer_slices.RemoveActor(actor)
+                self.slice_actors = []
+            
+            # Clear plots
+            self.figure.clear()
+            self.canvas.draw()
+            self.slice_figure.clear()
+            self.slice_canvas.draw()
+            
+            # Update VTK
+            self.vtk_widget_original.GetRenderWindow().Render()
+            self.vtk_widget_slices.GetRenderWindow().Render()
+            
+            # Disable controls
+            self.z_slice_input.setEnabled(False)
+            self.show_slice_btn.setEnabled(False)
+            self.viz_slice_thickness.setEnabled(False)
+            self.export_btn.setEnabled(False)
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            self.statusBar().showMessage("All data cleared - memory freed")
+
+    def load_file(self):
+        # Always allow single file selection for incremental loading
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Point Cloud File to Load/Append",
             "",
             "Point Cloud Files (*.txt *.csv *.xyz);;All Files (*.*)"
         )
         
-        if filenames:
-            # Auto-detect based on number of files selected
-            if len(filenames) == 1:
-                self.statusBar().showMessage(f"Loading single file: {os.path.basename(filenames[0])}...")
+        if filename:
+            # Check if we already have data
+            if hasattr(self, 'points') and self.points is not None:
+                # Ask user if they want to append or replace
+                from PyQt6.QtWidgets import QMessageBox
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Icon.Question)
+                msg.setWindowTitle("Data Already Loaded")
+                msg.setText(f"You already have {len(self.points):,} points loaded.")
+                msg.setInformativeText("What would you like to do with the new file?")
+                
+                # Create custom buttons with clear text
+                append_button = msg.addButton("Append to existing data", QMessageBox.ButtonRole.YesRole)
+                replace_button = msg.addButton("Replace existing data", QMessageBox.ButtonRole.NoRole)
+                cancel_button = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                
+                msg.setDefaultButton(append_button)
+                
+                # Show dialog and get result
+                result = msg.exec()
+                clicked_button = msg.clickedButton()
+                
+                if clicked_button == append_button:
+                    self.append_mode = True
+                    self.statusBar().showMessage(f"Appending {os.path.basename(filename)} to existing data...")
+                elif clicked_button == replace_button:
+                    self.append_mode = False
+                    self.statusBar().showMessage(f"Replacing data with {os.path.basename(filename)}...")
+                else:  # Cancel button or closed dialog
+                    return
             else:
-                self.statusBar().showMessage(f"Loading and combining {len(filenames)} files...")
+                self.append_mode = False
+                self.statusBar().showMessage(f"Loading {os.path.basename(filename)}...")
             
-            self.start_loading(filenames)
+            self.start_loading([filename])
 
     def start_loading(self, filenames):
-        """Start loading process for single or multiple files"""
+        """Start loading process for single file (with append mode)"""
         # Show progress bar and disable UI
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.setEnabled(False)
         
-        # Create and start worker thread for multiple files
-        self.load_worker = LoadMultiplePointCloudWorker(filenames)
+        # Create and start worker thread - use single file worker for incremental loading
+        self.load_worker = LoadPointCloudWorker(filenames[0])
         self.load_worker.progress.connect(self.update_progress)
         self.load_worker.finished.connect(self.load_finished)
         self.load_worker.error.connect(self.load_error)
         self.load_worker.start()
 
     def load_finished(self, result):
-        points, num_points = result
-        self.points = points
+        new_points, num_new_points = result
+        
+        # Handle append vs replace mode
+        if hasattr(self, 'append_mode') and self.append_mode and hasattr(self, 'points') and self.points is not None:
+            # Append mode: combine with existing data
+            old_count = len(self.points)
+            
+            # Check memory before combining
+            old_memory_mb = self.points.nbytes / (1024*1024)
+            new_memory_mb = new_points.nbytes / (1024*1024)
+            total_memory_mb = old_memory_mb + new_memory_mb
+            
+            if total_memory_mb > 4000:  # 4GB warning
+                from PyQt6.QtWidgets import QMessageBox
+                reply = QMessageBox.warning(
+                    self,
+                    "Memory Warning",
+                    f"Combined data will use ~{total_memory_mb:.0f}MB RAM\n"
+                    f"Current: {old_memory_mb:.0f}MB + New: {new_memory_mb:.0f}MB\n\n"
+                    f"This may cause performance issues. Continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                
+                if reply == QMessageBox.StandardButton.No:
+                    self.progress_bar.setVisible(False)
+                    self.setEnabled(True)
+                    self.statusBar().showMessage("Loading cancelled due to memory concerns")
+                    return
+            
+            try:
+                # Combine point clouds
+                self.statusBar().showMessage("Combining point clouds...")
+                self.progress_bar.setValue(50)
+                
+                combined_points = np.vstack([self.points, new_points])
+                
+                # Clear old data immediately to free memory
+                del self.points
+                del new_points
+                import gc
+                gc.collect()
+                
+                self.points = combined_points
+                total_points = len(self.points)
+                
+                self.statusBar().showMessage(f"Appended {num_new_points:,} points. Total: {total_points:,} points (was {old_count:,})")
+                
+            except MemoryError:
+                self.statusBar().showMessage("Not enough memory to combine point clouds")
+                self.progress_bar.setVisible(False)
+                self.setEnabled(True)
+                return
+            except Exception as e:
+                self.statusBar().showMessage(f"Error combining data: {str(e)}")
+                self.progress_bar.setVisible(False)
+                self.setEnabled(True)
+                return
+        else:
+            # Replace mode: clear old data first
+            if hasattr(self, 'points') and self.points is not None:
+                del self.points
+                import gc
+                gc.collect()
+            
+            self.points = new_points
+            self.statusBar().showMessage(f"Loaded {num_new_points:,} points")
+        
+        # Update UI ranges and display
+        self.update_ui_after_load()
+        
+        # Show final message
+        final_memory_mb = self.points.nbytes / (1024*1024)
+        self.statusBar().showMessage(f"Ready - {len(self.points):,} points ({final_memory_mb:.0f}MB)")
+
+    def update_ui_after_load(self):
+        """Update UI elements after loading data"""
+        # Clear old analysis results
+        if hasattr(self, 'current_results'):
+            del self.current_results
+            self.export_btn.setEnabled(False)
+        
+        # Clear VTK actors
+        if hasattr(self, 'point_cloud_actor') and self.point_cloud_actor:
+            self.renderer_original.RemoveActor(self.point_cloud_actor)
+            self.point_cloud_actor = None
+        
+        if hasattr(self, 'slice_actors'):
+            for actor in self.slice_actors:
+                self.renderer_slices.RemoveActor(actor)
+            self.slice_actors = []
         
         # Update Z range based on loaded data
         z_min = np.min(self.points[:, 2])
         z_max = np.max(self.points[:, 2])
+        z_range = z_max - z_min
         
         # Set Z spinbox range and initial value
         self.z_slice_input.setRange(z_min, z_max)
-        self.z_slice_input.setValue(z_min + (z_range := z_max - z_min)/2)
+        self.z_slice_input.setValue(z_min + z_range/2)
         self.z_slice_input.setSingleStep(z_range/50)
 
         # Set reasonable default thickness based on data range
@@ -471,20 +697,18 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.show_slice_btn.setEnabled(True)
         self.viz_slice_thickness.setEnabled(True)
         
+        # Update displays
         self.display_point_cloud()
         self.show_statistics()
+        
+        # Clear plots
+        self.figure.clear()
+        self.canvas.draw()
+        self.slice_figure.clear()
+        self.slice_canvas.draw()
+        
         self.progress_bar.setVisible(False)
         self.setEnabled(True)
-        
-        # Show appropriate message based on number of files loaded
-        if hasattr(self.load_worker, 'filenames'):
-            file_count = len(self.load_worker.filenames)
-            if file_count == 1:
-                self.statusBar().showMessage(f"Loaded {num_points:,} points")
-            else:
-                self.statusBar().showMessage(f"Combined {num_points:,} points from {file_count} files")
-        else:
-            self.statusBar().showMessage(f"Loaded {num_points:,} points")
 
     def load_error(self, error_msg):
         self.progress_bar.setVisible(False)
