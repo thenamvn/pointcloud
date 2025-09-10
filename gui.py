@@ -258,11 +258,35 @@ class CylinderAnalyzerGUI(QMainWindow):
         param_layout.addWidget(QLabel("Angle Bins:"))
         param_layout.addWidget(self.angle_bins)
 
+        quality_group = QWidget()
+        quality_layout = QHBoxLayout(quality_group)
+
+        quality_high_btn = QPushButton("High Quality")
+        quality_high_btn.clicked.connect(lambda: self.set_display_quality('high'))
+        quality_layout.addWidget(quality_high_btn)
+
+        quality_medium_btn = QPushButton("Medium")
+        quality_medium_btn.clicked.connect(lambda: self.set_display_quality('medium'))
+        quality_layout.addWidget(quality_medium_btn)
+
+        quality_fast_btn = QPushButton("Fast")
+        quality_fast_btn.clicked.connect(lambda: self.set_display_quality('fast'))
+        quality_layout.addWidget(quality_fast_btn)
+
+        control_layout.addWidget(quality_group)
+
+        # Initialize with medium quality
+        self.display_quality = 'medium'
+
+        # Add display quality controls
+        display_group = QWidget()
+        display_layout = QVBoxLayout(display_group)
+
         # Add checkbox for auto visualization
         self.auto_visualize = QCheckBox("Auto visualize slices after analysis")
         self.auto_visualize.setChecked(True)  # Default to enabled
         param_layout.addWidget(self.auto_visualize)
-        
+    
         # Analysis button
         analyze_btn = QPushButton("Analyze Slice")
         analyze_btn.clicked.connect(self.analyze_current)
@@ -855,37 +879,80 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.progress_bar.setVisible(False)
         self.setEnabled(True)
         self.statusBar().showMessage(f"Error loading file: {error_msg}")
-    
+
+    def set_display_quality(self, quality):
+        """Set display quality and refresh if we have data"""
+        self.display_quality = quality
+        if hasattr(self, 'points') and self.points is not None:
+            self.display_point_cloud()
+            
     def display_point_cloud(self):
         if self.point_cloud_actor:
             self.renderer_original.RemoveActor(self.point_cloud_actor)
             
+        # Get points based on current quality setting
+        display_points = self.get_display_points()
+        
+        # Get point size from quality setting
+        quality_settings = {
+            'high': {'max_points': 500000, 'point_size': 3},
+            'medium': {'max_points': 200000, 'point_size': 2},
+            'fast': {'max_points': 50000, 'point_size': 1}
+        }
+        point_size = quality_settings[self.display_quality]['point_size']
+        
         # Create VTK points
         vtk_points = vtk.vtkPoints()
-        for point in self.points:
+        for point in display_points:
             vtk_points.InsertNextPoint(point[0], point[1], point[2])
             
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(vtk_points)
         
-        # Vertex filter
         vertex_filter = vtk.vtkVertexGlyphFilter()
         vertex_filter.SetInputData(polydata)
         vertex_filter.Update()
         
-        # Create mapper and actor
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(vertex_filter.GetOutputPort())
         
         self.point_cloud_actor = vtk.vtkActor()
         self.point_cloud_actor.SetMapper(mapper)
         self.point_cloud_actor.GetProperty().SetColor(0.5, 0.5, 1.0)
-        self.point_cloud_actor.GetProperty().SetPointSize(3)
+        self.point_cloud_actor.GetProperty().SetPointSize(point_size)  # Use quality-based size
         
         self.renderer_original.AddActor(self.point_cloud_actor)
         self.renderer_original.ResetCamera()
         self.vtk_widget_original.GetRenderWindow().Render()
     
+    def get_display_points(self):
+        """Get subsampled points based on current quality setting"""
+        if self.points is None:
+            return np.array([])
+        
+        quality_settings = {
+            'high': {'max_points': 500000, 'point_size': 3},
+            'medium': {'max_points': 200000, 'point_size': 2},
+            'fast': {'max_points': 50000, 'point_size': 1}
+        }
+        
+        settings = quality_settings.get(self.display_quality, quality_settings['medium'])
+        max_points = settings['max_points']
+        total_points = len(self.points)
+        
+        if total_points <= max_points:
+            return self.points
+        
+        # Smart subsampling
+        sample_ratio = max_points / total_points
+        if sample_ratio > 0.7:
+            indices = np.random.choice(total_points, max_points, replace=False)
+        else:
+            step = int(1 / sample_ratio)
+            indices = np.arange(0, total_points, step)[:max_points]
+        
+        return self.points[indices]
+        
     def analyze_current(self):
         if self.points is None:
             self.statusBar().showMessage("Please load point cloud first")
