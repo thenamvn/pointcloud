@@ -88,11 +88,13 @@ class LoadMultiplePointCloudWorker(QThread):
             total_files = len(self.filenames)
             
             for file_idx, filename in enumerate(self.filenames):
-                self.progress.emit(int((file_idx / total_files) * 90))
+                # Calculate base progress for this file
+                base_progress = int((file_idx / total_files) * 90)
+                file_progress_range = int(90 / total_files)  # Each file gets portion of 90%
                 
                 try:
-                    # Parse each file
-                    file_points = self.parse_file(filename)
+                    # Parse each file with progress tracking
+                    file_points = self.parse_file_with_progress(filename, base_progress, file_progress_range)
                     
                     if len(file_points) == 0:
                         print(f"Warning: No valid points found in {filename}")
@@ -104,6 +106,9 @@ class LoadMultiplePointCloudWorker(QThread):
                 except Exception as e:
                     self.error.emit(f"Error reading {filename}: {str(e)}")
                     return
+                
+                # Update progress after each file
+                self.progress.emit(int(((file_idx + 1) / total_files) * 90))
             
             self.progress.emit(95)
             
@@ -134,8 +139,8 @@ class LoadMultiplePointCloudWorker(QThread):
         except Exception as e:
             self.error.emit(f"Unexpected error: {str(e)}")
     
-    def parse_file(self, filename):
-        """Parse single file - handles TXT, CSV, XYZ formats"""
+    def parse_file_with_progress(self, filename, base_progress, progress_range):
+        """Parse single file with progress updates"""
         points = []
         
         try:
@@ -148,26 +153,40 @@ class LoadMultiplePointCloudWorker(QThread):
         except:
             pass
         
-        # Manual parsing for text files
-        with open(filename, 'r') as f:
-            for line_num, line in enumerate(f):
-                line = line.strip()
-                
-                # Skip empty lines and comments
-                if not line or line.startswith('#') or line.startswith('//'):
-                    continue
-                
-                try:
-                    # Handle different separators
-                    line = line.replace(',', ' ').replace(';', ' ').replace('\t', ' ')
-                    coords = [float(x) for x in line.split() if x]
+        # Manual parsing for text files with progress
+        try:
+            # Count total lines first for progress calculation
+            with open(filename, 'r') as f:
+                total_lines = sum(1 for _ in f)
+            
+            # Parse with progress updates
+            with open(filename, 'r') as f:
+                for line_num, line in enumerate(f):
+                    line = line.strip()
                     
-                    if len(coords) >= 3:
-                        points.append(coords[:3])
+                    # Skip empty lines and comments
+                    if not line or line.startswith('#') or line.startswith('//'):
+                        continue
+                    
+                    try:
+                        # Handle different separators
+                        line = line.replace(',', ' ').replace(';', ' ').replace('\t', ' ')
+                        coords = [float(x) for x in line.split() if x]
                         
-                except ValueError:
-                    continue
+                        if len(coords) >= 3:
+                            points.append(coords[:3])
+                            
+                    except ValueError:
+                        continue
+                    
+                    # Update progress every 5000 lines to avoid too frequent updates
+                    if line_num % 5000 == 0 and total_lines > 0:
+                        file_progress = int((line_num / total_lines) * progress_range)
+                        self.progress.emit(base_progress + file_progress)
         
+        except Exception as e:
+            print(f"Error parsing {filename}: {e}")
+            
         return points
     
 class CylinderAnalyzerGUI(QMainWindow):
