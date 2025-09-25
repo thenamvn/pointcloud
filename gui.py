@@ -1112,6 +1112,25 @@ class CylinderAnalyzerGUI(QMainWindow):
         
         self.statusBar().showMessage(f"Visualizing {max_plots} residual profiles...")
         
+        # Ask user for PDF save location
+        pdf_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Residual Profiles to PDF",
+            f"residual_profiles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+            "PDF Files (*.pdf);;All Files (*.*)"
+        )
+        
+        # Import PdfPages for multi-page PDF
+        from matplotlib.backends.backend_pdf import PdfPages
+        
+        pdf_pages = None
+        if pdf_path:
+            try:
+                pdf_pages = PdfPages(pdf_path)
+            except Exception as e:
+                self.statusBar().showMessage(f"Error creating PDF: {str(e)}")
+                pdf_path = None
+        
         # Create subplots for each slice
         for i, result in enumerate(self.current_results[:max_plots]):
             ax = self.figure.add_subplot(rows, cols, i + 1)
@@ -1140,7 +1159,7 @@ class CylinderAnalyzerGUI(QMainWindow):
                 # Formatting
                 ax.set_xlabel('θ (deg)', fontsize=6 if num_slices > 25 else 8)
                 ax.set_ylabel('Δr', fontsize=6 if num_slices > 25 else 8)
-                ax.set_title(f'Z={z_target:.2f}m', fontsize=6 if num_slices > 25 else 8)
+                ax.set_title(f'Z={z_target:.2f}m, Thickness={slice_thickness:.3f}m', fontsize=6 if num_slices > 25 else 8)
                 ax.grid(True, alpha=0.3)
                 ax.legend(fontsize=6 if num_slices > 25 else 8)
                 
@@ -1150,11 +1169,36 @@ class CylinderAnalyzerGUI(QMainWindow):
                 # Adjust ticks for readability
                 ax.tick_params(labelsize=5 if num_slices > 25 else 7)
                 
+                # Save individual plot to PDF if requested
+                if pdf_pages:
+                    # Create a separate figure for PDF page
+                    fig_pdf = plt.figure(figsize=(8, 6))
+                    ax_pdf = fig_pdf.add_subplot(1, 1, 1)
+                    
+                    # Replicate the plot for PDF
+                    ax_pdf.axhline(0.0, color='k', linestyle='--', linewidth=1.5, label='Ideal circle (Δr=0)')
+                    ax_pdf.plot(theta_deg, delta_r, 'b-', linewidth=1, label='Δr = r - R')
+                    ax_pdf.set_xlabel('θ (deg)', fontsize=8)
+                    ax_pdf.set_ylabel('Δr', fontsize=8)
+                    ax_pdf.set_title(f'Z={z_target:.2f}m, Thickness={slice_thickness:.3f}m', fontsize=8)
+                    ax_pdf.grid(True, alpha=0.3)
+                    ax_pdf.legend(fontsize=8)
+                    ax_pdf.set_xticks(np.arange(0, 360, 30))
+                    
+                    fig_pdf.tight_layout()
+                    pdf_pages.savefig(fig_pdf)
+                    plt.close(fig_pdf)
+                
             except Exception as e:
                 # If individual slice fails, show error
                 ax.text(0.5, 0.5, f'Error:\n{str(e)[:20]}...', 
                     ha='center', va='center', transform=ax.transAxes, fontsize=6)
                 ax.set_title(f'Z={result["z_center"]:.2f}m - Error', fontsize=6)
+        
+        # Close PDF if created
+        if pdf_pages:
+            pdf_pages.close()
+            self.statusBar().showMessage(f"PDF saved to {pdf_path}")
         
         # Adjust layout - Show analysis thickness in title
         title_fontsize = 10 if num_slices > 25 else 12
@@ -1172,7 +1216,7 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.results_tabs.setCurrentIndex(1)  # Switch to Plots tab
         
         self.statusBar().showMessage(f"All {max_plots} slices visualized in Plots tab (Thickness: {slice_thickness:.3f}m)")
-        
+
     def display_results(self, results):
         # Update table with all columns
         headers = [
