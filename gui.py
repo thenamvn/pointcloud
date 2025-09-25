@@ -213,7 +213,25 @@ class CylinderAnalyzerGUI(QMainWindow):
         # Parameters section
         param_group = QWidget()
         param_layout = QVBoxLayout(param_group)
-        
+
+        self.z_min_input = QDoubleSpinBox()
+        self.z_min_input.setRange(-10000, 10000)  # Wide range
+        self.z_min_input.setValue(0.0)  # Default, will be updated on data load
+        self.z_min_input.setSingleStep(1.0)
+        self.z_min_input.setDecimals(3)
+        self.z_min_input.setEnabled(False)  # Disable until data loads
+        param_layout.addWidget(QLabel("Z Min (m):"))
+        param_layout.addWidget(self.z_min_input)
+
+        self.z_max_input = QDoubleSpinBox()
+        self.z_max_input.setRange(-10000, 10000)
+        self.z_max_input.setValue(0.0)  # Default, will be updated on data load
+        self.z_max_input.setSingleStep(1.0)
+        self.z_max_input.setDecimals(3)
+        self.z_max_input.setEnabled(False)
+        param_layout.addWidget(QLabel("Z Max (m):"))
+        param_layout.addWidget(self.z_max_input)
+
         # Z-window parameters
         self.z_window = QDoubleSpinBox()
         # self.z_window.setRange(0.001, 0.1)  # 1mm to 100mm in meters
@@ -842,6 +860,12 @@ class CylinderAnalyzerGUI(QMainWindow):
         # Update Z range based on loaded data
         z_min = np.min(self.points[:, 2])
         z_max = np.max(self.points[:, 2])
+        self.z_min_input.setRange(z_min, z_max)
+        self.z_min_input.setValue(z_min)
+        self.z_max_input.setValue(z_max)
+        self.z_max_input.setRange(z_min, z_max)
+        self.z_min_input.setEnabled(True)
+        self.z_max_input.setEnabled(True)
         z_range = z_max - z_min
         
         # Set Z spinbox range and initial value
@@ -1001,7 +1025,9 @@ class CylinderAnalyzerGUI(QMainWindow):
             'overlay_all': True,
             'max_points_for_speed': 1_000_000,
             'min_points_per_slice': 1000,
-            'inlier_quantile': 0.80
+            'inlier_quantile': 0.80,
+            'z_min': self.z_min_input.value(),
+            'z_max': self.z_max_input.value()
         }
         
         # Disable UI during analysis

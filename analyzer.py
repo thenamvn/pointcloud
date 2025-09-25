@@ -4,7 +4,7 @@ Main analysis module for processing cylinder point clouds
 import os
 import numpy as np
 import pandas as pd
-from typing import Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
 
 from utils.data_io import load_txt_points, save_results  # Modified imports
@@ -26,12 +26,15 @@ class Config:
     draw_per_slice_images: bool = True
     slice_plot_sample_points: int = 30000
     overlay_all: bool = True
+    z_min: Optional[float] = None
+    z_max: Optional[float] = None
 
 class CylinderAnalyzer:
     def __init__(self, config: Config = None):
         self.config = config or Config()
         self.dz = self.config.window_len / 2.0
-        
+        self.z_min = self.config.z_min
+        self.z_max = self.config.z_max
         # Output paths
         self.slice_fig_dir = 'plots_slices'
         self.results_csv = 'slice_results.csv'
@@ -187,6 +190,13 @@ class CylinderAnalyzer:
         if points.ndim != 2 or points.shape[1] != 3:
             raise ValueError("Points must be Nx3 array")
 
+        # Filter points to specified Z range if provided
+        if self.z_min is not None and self.z_max is not None:
+            mask = (points[:, 2] >= self.z_min) & (points[:, 2] <= self.z_max)
+            points = points[mask]
+            if len(points) == 0:
+                raise ValueError(f"No points in specified Z range [{self.z_min}, {self.z_max}]")
+
         results = []
         z_centers = self.calculate_z_centers(points)
         total = len(z_centers)
@@ -212,10 +222,14 @@ class CylinderAnalyzer:
                 progress_callback(progress)
 
         return results  # Now returns list of dictionaries
-    
+
     def calculate_z_centers(self, points: np.ndarray) -> np.ndarray:
         """Calculate z-centers for slicing"""
-        z_min, z_max = points[:,2].min(), points[:,2].max()
+        # Use specified z_min/z_max if provided, otherwise use data range
+        if self.z_min is not None and self.z_max is not None:
+            z_min, z_max = self.z_min, self.z_max
+        else:
+            z_min, z_max = points[:, 2].min(), points[:, 2].max()
         
         if z_max - z_min < self.config.window_len:
             return np.array([(z_min + z_max) / 2.0])
