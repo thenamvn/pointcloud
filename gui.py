@@ -232,18 +232,8 @@ class CylinderAnalyzerGUI(QMainWindow):
         param_layout.addWidget(QLabel("Z Max (m):"))
         param_layout.addWidget(self.z_max_input)
 
-        # Z-window parameters
-        self.z_window = QDoubleSpinBox()
-        # self.z_window.setRange(0.001, 0.1)  # 1mm to 100mm in meters
-        self.z_window.setValue(9)  # 9 in meters
-        self.z_window.setSingleStep(0.5)  # 0.5mm in meters
-        self.z_window.setDecimals(4)  # Show 4 decimal places for meters
-        self.z_window.setEnabled(True)
-        param_layout.addWidget(QLabel("Window Length (m):"))
-        param_layout.addWidget(self.z_window)
-        
         self.z_step = QDoubleSpinBox()
-        # self.z_step.setRange(0.0001, 0.05)  # 0.1mm to 50mm in meters
+        self.z_step.setRange(0.0001, 0.05)  # 0.1mm to 50mm in meters
         self.z_step.setValue(2)  # 2 in meters
         self.z_step.setSingleStep(0.1)  # 0.1mm in meters
         self.z_step.setDecimals(4)  # Show 4 decimal places for meters
@@ -254,7 +244,7 @@ class CylinderAnalyzerGUI(QMainWindow):
         
         # Add slice thickness control
         self.slice_thickness = QDoubleSpinBox()
-        # self.slice_thickness.setRange(0.001, 0.05)  # 1mm to 50mm in meters
+        self.slice_thickness.setRange(0.001, 0.05)  # 1mm to 50mm in meters
         self.slice_thickness.setValue(0.5)  # 5mm default
         self.slice_thickness.setSingleStep(0.1)
         self.slice_thickness.setDecimals(4)
@@ -797,8 +787,6 @@ class CylinderAnalyzerGUI(QMainWindow):
                 )
                 
                 if reply == QMessageBox.StandardButton.No:
-                    self.progress_bar.setVisible(False)
-                    self.setEnabled(True)
                     self.statusBar().showMessage("Loading cancelled due to memory concerns")
                     return
             try:
@@ -1016,7 +1004,6 @@ class CylinderAnalyzerGUI(QMainWindow):
             
         # Get parameters from GUI
         params = {
-            'window_len': self.z_window.value(),
             'z_step': self.z_step.value(),
             'boundary_method': self.boundary_method.currentText(),
             'angle_bins': self.angle_bins.value(),
@@ -1170,7 +1157,7 @@ class CylinderAnalyzerGUI(QMainWindow):
                 if profile is None:
                     ax.text(0.5, 0.5, 'No boundary data', 
                         ha='center', va='center', transform=ax.transAxes)
-                    ax.set_title(f'Z={z_target:.2f}m')
+                    ax.set_title(f'Z={z_target:.2f}m, Thickness={slice_thickness:.3f}m')
                     continue
                 
                 theta, delta_r = profile
@@ -1219,7 +1206,7 @@ class CylinderAnalyzerGUI(QMainWindow):
                 # If individual slice fails, show error
                 ax.text(0.5, 0.5, f'Error:\n{str(e)[:20]}...', 
                     ha='center', va='center', transform=ax.transAxes, fontsize=6)
-                ax.set_title(f'Z={result["z_center"]:.2f}m - Error', fontsize=6)
+                ax.set_title(f'Z={result["z_center"]:.2f}m, Thickness={slice_thickness:.3f}m - Error', fontsize=6)
         
         # Close PDF if created
         if pdf_pages:
@@ -1590,7 +1577,6 @@ class CylinderAnalyzerGUI(QMainWindow):
             
         # Configure parameters with visualization thickness
         params = {
-            'window_len': slice_thickness,  # Use visualization thickness
             'z_step': self.z_step.value(),
             'boundary_method': self.boundary_method.currentText(),
             'angle_bins': self.angle_bins.value(),

@@ -16,7 +16,6 @@ from utils.visualization import plot_slice, plot_summary, plot_overlay
 @dataclass
 class Config:
     """Analysis configuration parameters"""
-    window_len: float = 9.0
     z_step: float = 2.0
     max_points_for_speed: int = 1_000_000
     min_points_per_slice: int = 1000
@@ -32,7 +31,6 @@ class Config:
 class CylinderAnalyzer:
     def __init__(self, config: Config = None):
         self.config = config or Config()
-        self.dz = self.config.window_len / 2.0
         self.z_min = self.config.z_min
         self.z_max = self.config.z_max
         # Output paths
@@ -46,8 +44,9 @@ class CylinderAnalyzer:
     
     def process_slice(self, points: np.ndarray, z_center: float) -> Tuple[dict, pd.DataFrame, str]:
         """Process a single slice of points"""
-        # Filter points in z-window
-        mask = (points[:,2] >= z_center - self.dz) & (points[:,2] <= z_center + self.dz)
+        # Filter points in z-window (using z_step for dz)
+        dz = self.config.z_step / 2.0
+        mask = (points[:,2] >= z_center - dz) & (points[:,2] <= z_center + dz)
         slc = points[mask][:,:2]  # Only x,y
         n0 = len(slc)
         
@@ -63,7 +62,7 @@ class CylinderAnalyzer:
         hybrid_result = fit_circle_hybrid_at_z(
             points_xyz=points[mask],  # Pass full XYZ for z-filtering
             z_elevation=z_center,
-            z_tolerance=self.dz,
+            z_tolerance=dz,
             inlier_tol=0.5,  # Default values, can be parameterized later
             max_trials=4000,
             min_inliers_frac=0.1,
@@ -97,8 +96,8 @@ class CylinderAnalyzer:
         # Compile results
         result = {
             "z_center": z_center,
-            "z_low": z_center - self.dz, 
-            "z_high": z_center + self.dz,
+            "z_low": z_center - dz, 
+            "z_high": z_center + dz,
             "n_points_slice": int(n0),
             "n_edge": int(len(candidates_xy)),  # Number of boundary points
             "cx": cx, "cy": cy, "R": R,
@@ -133,15 +132,13 @@ class CylinderAnalyzer:
         points = load_txt_points(file_path)
         z_min, z_max = points[:,2].min(), points[:,2].max()
         print(f"Z range in data: [{z_min:.3f}, {z_max:.3f}]  "
-              f"| window={self.config.window_len}  step={self.config.z_step}")
+              f"| step={self.config.z_step}")
         
-        # Define z-centers
-        if z_max - z_min < self.config.window_len:
-            z_centers = np.array([(z_min + z_max)/2.0])
-        else:
-            z_centers = np.arange(z_min + self.dz, 
-                                z_max - self.dz + 1e-9, 
-                                self.config.z_step)
+        # Define z-centers (using z_step only)
+        dz = self.config.z_step / 2.0
+        z_centers = np.arange(z_min + dz, 
+                            z_max - dz + 1e-9, 
+                            self.config.z_step)
         
         results = []
         point_rows = []
@@ -162,7 +159,7 @@ class CylinderAnalyzer:
             if self.config.draw_per_slice_images:
                 out_png = os.path.join(self.slice_fig_dir, f"slice_zc={zc:.3f}.png")
                 plot_slice(slc, edge_xy, (xc,yc), R, res, 
-                          self.config.window_len, self.config.z_step,
+                          self.config.z_step, self.config.z_step,  # Use z_step for both
                           self.config.boundary_method, out_png,
                           self.config.slice_plot_sample_points)
         
@@ -172,7 +169,7 @@ class CylinderAnalyzer:
             df_res = pd.DataFrame(results)
             
             # Generate summary plots
-            plot_summary(df_res, self.config.window_len, self.config.z_step)
+            plot_summary(df_res, self.config.z_step, self.config.z_step)  # Use z_step for both
             
             # Generate overlay plot
             if self.config.overlay_all:
@@ -202,7 +199,8 @@ class CylinderAnalyzer:
         total = len(z_centers)
 
         for i, zc in enumerate(z_centers):
-            mask = (points[:, 2] >= zc - self.dz) & (points[:, 2] <= zc + self.dz)
+            dz = self.config.z_step / 2.0
+            mask = (points[:, 2] >= zc - dz) & (points[:, 2] <= zc + dz)
             slice_points = points[mask]
             
             if len(slice_points) < self.config.min_points_per_slice:
@@ -231,9 +229,7 @@ class CylinderAnalyzer:
         else:
             z_min, z_max = points[:, 2].min(), points[:, 2].max()
         
-        if z_max - z_min < self.config.window_len:
-            return np.array([(z_min + z_max) / 2.0])
-        else:
-            return np.arange(z_min + self.dz, 
-                            z_max - self.dz + 1e-9, 
-                            self.config.z_step)
+        dz = self.config.z_step / 2.0
+        return np.arange(z_min + dz, 
+                        z_max - dz + 1e-9, 
+                        self.config.z_step)
