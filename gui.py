@@ -3,7 +3,7 @@ import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                             QSpinBox, QDoubleSpinBox, QComboBox, QProgressBar,
-                            QTableWidget, QTableWidgetItem, QTabWidget, QSplitter, QCheckBox)
+                            QTableWidget, QTableWidgetItem, QTabWidget, QSplitter, QCheckBox, QInputDialog)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 import vtk
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import pandas as pd
 import os
+from datetime import datetime
 
 class AnalysisWorker(QThread):
     progress = pyqtSignal(int)
@@ -158,7 +159,7 @@ class LoadMultiplePointCloudWorker(QThread):
             with open(filename, 'r') as f:
                 total_lines = sum(1 for _ in f)
             
-            # Parse with progress updates
+            # Parse with progress every 5000 lines to avoid too frequent updates
             with open(filename, 'r') as f:
                 for line_num, line in enumerate(f):
                     line = line.strip()
@@ -289,6 +290,13 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.export_btn = export_btn  # Store reference to enable/disable
         param_layout.addWidget(export_btn)
         
+        # NEW: Add export data year button
+        export_year_btn = QPushButton("Export Data Year")
+        export_year_btn.clicked.connect(self.export_data_year)
+        export_year_btn.setEnabled(False)  # Disable until we have results
+        self.export_year_btn = export_year_btn  # Store reference to enable/disable
+        param_layout.addWidget(export_year_btn)
+        
         control_layout.addWidget(param_group)
         control_layout.addStretch()
 
@@ -343,6 +351,13 @@ class CylinderAnalyzerGUI(QMainWindow):
         show_slice_btn.setEnabled(False)  # Disable until data loads
         self.show_slice_btn = show_slice_btn
         slice_viz_layout.addWidget(show_slice_btn)
+
+        # NEW: Add export slice button
+        export_slice_btn = QPushButton("Export Slice")
+        export_slice_btn.clicked.connect(self.export_slice)
+        export_slice_btn.setEnabled(False)  # Disable until slice is visualized
+        self.export_slice_btn = export_slice_btn
+        slice_viz_layout.addWidget(export_slice_btn)
         
         # Add to control panel after parameters
         control_layout.addWidget(slice_viz_group)
@@ -397,7 +412,7 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.vtk_widget_slices = QVTKRenderWindowInteractor()
         self.renderer_slices = vtk.vtkRenderer()
         self.vtk_widget_slices.GetRenderWindow().AddRenderer(self.renderer_slices)
-        self.renderer_slices.SetBackground(0.1, 0.1, 0.2)
+        self.renderer_slices.SetBackground(0.1, 0.2, 0.2)
         
         # Add labels for each view
         original_frame = QWidget()
@@ -478,7 +493,7 @@ class CylinderAnalyzerGUI(QMainWindow):
             memory_mb = process.memory_info().rss / (1024 * 1024)
             
             if hasattr(self, 'points') and self.points is not None:
-                points_mb = self.points.nbytes / (1024 * 1024)
+                points_mb = self.points.nbytes / (1024*1024)
                 self.memory_label.setText(f"RAM: {memory_mb:.0f}MB (Points: {points_mb:.0f}MB)")
                 
                 # Color coding
@@ -550,6 +565,8 @@ class CylinderAnalyzerGUI(QMainWindow):
             self.show_slice_btn.setEnabled(False)
             self.viz_slice_thickness.setEnabled(False)
             self.export_btn.setEnabled(False)
+            self.export_year_btn.setEnabled(False)  # NEW: Disable export year button
+            self.export_slice_btn.setEnabled(False)  # NEW: Disable export slice button
             
             # Force garbage collection
             import gc
@@ -566,43 +583,14 @@ class CylinderAnalyzerGUI(QMainWindow):
             "Point Cloud Files (*.txt *.csv *.xyz);;All Files (*.*)"
         )
         
-        if not filenames:
-            return
-        
-        # Check if we already have data and determine mode
-        if hasattr(self, 'points') and self.points is not None:
-            from PyQt6.QtWidgets import QMessageBox
-            msg = QMessageBox()
-            msg.setIcon(QMessageBox.Icon.Question)
-            msg.setWindowTitle("Data Already Loaded")
-            msg.setText(f"You already have {len(self.points):,} points loaded.")
-            msg.setInformativeText(f"Selected {len(filenames)} new file(s). What would you like to do?")
-            
-            append_button = msg.addButton("Append all files to existing data", QMessageBox.ButtonRole.YesRole)
-            replace_button = msg.addButton("Replace with new files", QMessageBox.ButtonRole.NoRole)
-            cancel_button = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            
-            msg.setDefaultButton(append_button)
-            result = msg.exec()
-            clicked_button = msg.clickedButton()
-            
-            if clicked_button == append_button:
-                self.append_mode = True
-            elif clicked_button == replace_button:
-                self.append_mode = False
-                # Clear existing data first
-                if hasattr(self, 'points'):
-                    del self.points
-                    self.points = None
-                    import gc
-                    gc.collect()
+        if filenames:
+            # Auto-detect based on number of files selected
+            if len(filenames) == 1:
+                self.statusBar().showMessage(f"Loading single file: {os.path.basename(filenames[0])}...")
             else:
-                return
-        else:
-            self.append_mode = False
-        
-        # Start incremental loading
-        self.start_incremental_loading(filenames)
+                self.statusBar().showMessage(f"Loading and combining {len(filenames)} files...")
+            
+            self.start_incremental_loading(filenames)
 
     def start_incremental_loading(self, filenames):
         """Load multiple files incrementally to avoid memory overflow"""
@@ -795,7 +783,6 @@ class CylinderAnalyzerGUI(QMainWindow):
                     self.setEnabled(True)
                     self.statusBar().showMessage("Loading cancelled due to memory concerns")
                     return
-            
             try:
                 combined_points = np.vstack([self.points, new_points])
                 del self.points
@@ -840,6 +827,7 @@ class CylinderAnalyzerGUI(QMainWindow):
         if hasattr(self, 'current_results'):
             del self.current_results
             self.export_btn.setEnabled(False)
+            self.export_year_btn.setEnabled(False)  # NEW: Disable export year button
         
         # Clear VTK actors
         if hasattr(self, 'point_cloud_actor') and self.point_cloud_actor:
@@ -1045,6 +1033,7 @@ class CylinderAnalyzerGUI(QMainWindow):
         if results["status"] == "success":
             self.current_results = results["results"]
             self.export_btn.setEnabled(True)
+            self.export_year_btn.setEnabled(True)  # NEW: Enable export year button
             self.display_results(self.current_results)
             
             # Auto-visualize all slices in Plots tab
@@ -1059,15 +1048,33 @@ class CylinderAnalyzerGUI(QMainWindow):
         else:
             self.statusBar().showMessage("Analysis failed")
 
+    # NEW: Add method to compute residual profile
+    def compute_residual_profile(self, result):
+        """Compute theta and delta_r for a slice result, using boundary points."""
+        if "boundary_points" not in result or not result["boundary_points"]:
+            return None
+        boundary_xy = np.array(result["boundary_points"])
+        cx, cy, R = result["cx"], result["cy"], result["R"]
+        
+        dx = boundary_xy[:, 0] - cx
+        dy = boundary_xy[:, 1] - cy
+        theta = (np.arctan2(dy, dx) + 2 * np.pi) % (2 * np.pi)
+        r = np.hypot(dx, dy)
+        delta_r = r - R
+        
+        # Sort by theta for smooth plotting
+        order = np.argsort(theta)
+        return theta[order], delta_r[order]
+
     def visualize_all_slices_in_plots(self):
-        """Visualize all analyzed slices in the Plots tab"""
+        """Visualize residual profiles (Δr vs θ) for all analyzed slices in the Plots tab"""
         if not hasattr(self, 'current_results') or not self.current_results:
             return
         
         # Clear previous plots
         self.figure.clear()
         
-        # Get thickness for visualization - Use analysis slice thickness, not viz thickness
+        # Get slice thickness for title
         slice_thickness = self.slice_thickness.value()
         
         # Determine grid layout based on number of slices - REMOVED 16 plot limit
@@ -1103,7 +1110,7 @@ class CylinderAnalyzerGUI(QMainWindow):
         if num_slices > 16:
             self.figure.set_size_inches(12, 10)  # Larger figure for more plots
         
-        self.statusBar().showMessage(f"Visualizing {max_plots} slices...")
+        self.statusBar().showMessage(f"Visualizing {max_plots} residual profiles...")
         
         # Create subplots for each slice
         for i, result in enumerate(self.current_results[:max_plots]):
@@ -1112,95 +1119,36 @@ class CylinderAnalyzerGUI(QMainWindow):
             try:
                 # Get slice data
                 z_target = result['z_center']
-                cx = result['cx']
-                cy = result['cy']
-                radius = result['R']
-                ovality_pct = result.get('ovality_pct', 0.0)
                 
-                dz = slice_thickness / 2.0
-                
-                # Get slice points
-                mask = (self.points[:, 2] >= z_target - dz) & (self.points[:, 2] <= z_target + dz)
-                slice_points = self.points[mask]
-                
-                if len(slice_points) < 50:  # Skip if too few points
-                    ax.text(0.5, 0.5, f'Too few points\n({len(slice_points)})', 
+                # Compute residual profile
+                profile = self.compute_residual_profile(result)
+                if profile is None:
+                    ax.text(0.5, 0.5, 'No boundary data', 
                         ha='center', va='center', transform=ax.transAxes)
                     ax.set_title(f'Z={z_target:.2f}m')
                     continue
                 
-                # Subsample points for faster plotting - reduce for many plots
-                max_points = 3000 if num_slices > 20 else 5000
-                if len(slice_points) > max_points:
-                    idx = np.random.choice(len(slice_points), max_points, replace=False)
-                    plot_points = slice_points[idx]
-                else:
-                    plot_points = slice_points
+                theta, delta_r = profile
                 
-                # Plot points - smaller points for many plots
-                point_size = 0.3 if num_slices > 20 else 0.5
-                ax.scatter(plot_points[:, 0], plot_points[:, 1], 
-                        s=point_size, alpha=0.4, c='lightblue', rasterized=True)
+                # Convert theta from radians to degrees
+                theta_deg = np.degrees(theta)
                 
-                # Try to get and plot boundary if available
-                try:
-                    # Re-analyze this slice to get boundary - Use analysis parameters
-                    params = {
-                        'window_len': slice_thickness,
-                        'z_step': self.z_step.value(),
-                        'boundary_method': self.boundary_method.currentText(),
-                        'angle_bins': self.angle_bins.value(),
-                        'max_points_for_speed': 1_000_000,
-                        'min_points_per_slice': 50,
-                        'inlier_quantile': 0.80
-                    }
-                    
-                    analyzer = CylinderAnalyzer(Config(**params))
-                    slice_result = analyzer.process_slice(slice_points, z_target)
-                    
-                    if slice_result and len(slice_result) >= 3:
-                        inner_tuple = slice_result[0]
-                        if isinstance(inner_tuple, tuple) and len(inner_tuple) >= 2:
-                            edge_xy = inner_tuple[1]
-                            if edge_xy is not None and len(edge_xy) > 0:
-                                line_width = 0.8 if num_slices > 20 else 1.0
-                                ax.plot(edge_xy[:, 0], edge_xy[:, 1], 'k-', 
-                                    linewidth=line_width, alpha=0.8)
-                except:
-                    pass  # Skip boundary if failed
+                # Plot baseline (ideal circle) and residuals
+                ax.axhline(0.0, color='k', linestyle='--', linewidth=1.5, label='Ideal circle (Δr=0)')
+                ax.plot(theta_deg, delta_r, 'b-', linewidth=1, label='Δr = r - R')
                 
-                # Plot fitted circle
-                theta = np.linspace(0, 2*np.pi, 360)
-                circle_x = cx + radius * np.cos(theta)
-                circle_y = cy + radius * np.sin(theta)
-                circle_width = 1.0 if num_slices > 20 else 1.5
-                ax.plot(circle_x, circle_y, 'r-', linewidth=circle_width, alpha=0.9)
+                # Formatting
+                ax.set_xlabel('θ (deg)', fontsize=6 if num_slices > 25 else 8)
+                ax.set_ylabel('Δr', fontsize=6 if num_slices > 25 else 8)
+                ax.set_title(f'Z={z_target:.2f}m', fontsize=6 if num_slices > 25 else 8)
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=6 if num_slices > 25 else 8)
                 
-                # Plot center
-                marker_size = 6 if num_slices > 20 else 8
-                ax.plot(cx, cy, 'r+', markersize=marker_size, markeredgewidth=2)
+                # Set ticks every 30 degrees
+                ax.set_xticks(np.arange(0, 360, 30))
                 
-                # Set equal aspect and limits
-                ax.set_aspect('equal')
-                
-                # Set title with key information - smaller font for many plots
-                title_fontsize = 6 if num_slices > 25 else 8
-                ax.set_title(f'Z={z_target:.2f}m\nR={radius:.3f}m, O={ovality_pct:.1f}%', 
-                            fontsize=title_fontsize)
-                
-                # Minimal axis labels for space - only for bottom and left edges
-                label_fontsize = 6 if num_slices > 25 else 8
-                if i >= num_slices - cols:  # Bottom row
-                    ax.set_xlabel('X (m)', fontsize=label_fontsize)
-                if i % cols == 0:  # Left column
-                    ax.set_ylabel('Y (m)', fontsize=label_fontsize)
-                    
-                # Smaller tick labels
-                tick_fontsize = 5 if num_slices > 25 else 7
-                ax.tick_params(labelsize=tick_fontsize)
-                
-                # Add grid
-                ax.grid(True, alpha=0.2 if num_slices > 20 else 0.3)
+                # Adjust ticks for readability
+                ax.tick_params(labelsize=5 if num_slices > 25 else 7)
                 
             except Exception as e:
                 # If individual slice fails, show error
@@ -1210,7 +1158,7 @@ class CylinderAnalyzerGUI(QMainWindow):
         
         # Adjust layout - Show analysis thickness in title
         title_fontsize = 10 if num_slices > 25 else 12
-        self.figure.suptitle(f'All Analyzed Slices (Analysis Thickness: {slice_thickness:.3f}m)', 
+        self.figure.suptitle(f'Residual Profiles (Δr vs θ) - Analysis Thickness: {slice_thickness:.3f}m', 
                             fontsize=title_fontsize)
         
         # Tighter layout for many plots
@@ -1224,6 +1172,7 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.results_tabs.setCurrentIndex(1)  # Switch to Plots tab
         
         self.statusBar().showMessage(f"All {max_plots} slices visualized in Plots tab (Thickness: {slice_thickness:.3f}m)")
+        
     def display_results(self, results):
         # Update table with all columns
         headers = [
@@ -1437,7 +1386,117 @@ class CylinderAnalyzerGUI(QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f"Error exporting results: {str(e)}")
     
-    # Add this method to CylinderAnalyzerGUI class
+    # NEW: Add method to export data for a specific year
+    def export_data_year(self):
+        """Export data for a specific year with detailed boundary information for comparison"""
+        if not hasattr(self, 'current_results'):
+            self.statusBar().showMessage("No results to export")
+            return
+        
+        # Get year from user input
+        year, ok = QInputDialog.getText(
+            self,
+            "Enter Year",
+            "Enter the year this data was scanned:",
+            text=str(datetime.now().year)
+        )
+        
+        if not ok or not year.strip():
+            return
+        
+        try:
+            year = year.strip()
+            
+            # Get directory to save files
+            save_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Select Directory to Save Year Data",
+                "",
+                QFileDialog.Option.ShowDirsOnly
+            )
+            
+            if not save_dir:
+                return
+            
+            # Prepare data for export
+            export_data = []
+            
+            for result in self.current_results:
+                z_center = result['z_center']
+                cx = result['cx']
+                cy = result['cy']
+                R = result['R']
+                thickness = self.slice_thickness.value()  # Get current slice thickness
+                
+                # Get boundary points and compute delta_r
+                if 'boundary_points' in result and result['boundary_points']:
+                    boundary_xy = np.array(result['boundary_points'])
+                    
+                    # Compute delta_r for each boundary point
+                    dx = boundary_xy[:, 0] - cx
+                    dy = boundary_xy[:, 1] - cy
+                    r = np.hypot(dx, dy)
+                    delta_r = r - R
+                    
+                    # Compute theta for ordering
+                    theta = (np.arctan2(dy, dx) + 2 * np.pi) % (2 * np.pi)
+                    
+                    # Create rows for each boundary point
+                    for i, (theta_val, delta_r_val) in enumerate(zip(theta, delta_r)):
+                        export_data.append({
+                            'year': year,
+                            'z_center': z_center,
+                            'cx': cx,
+                            'cy': cy,
+                            'R': R,
+                            'thickness': thickness,
+                            'theta': theta_val,
+                            'delta_r': delta_r_val,
+                            'boundary_point_index': i
+                        })
+                else:
+                    # If no boundary points, still export slice info with NaN delta_r
+                    export_data.append({
+                        'year': year,
+                        'z_center': z_center,
+                        'cx': cx,
+                        'cy': cy,
+                        'R': R,
+                        'thickness': thickness,
+                        'theta': np.nan,
+                        'delta_r': np.nan,
+                        'boundary_point_index': 0
+                    })
+            
+            # Create DataFrame and save
+            df_export = pd.DataFrame(export_data)
+            export_path = os.path.join(save_dir, f"year_{year}_boundary_data.csv")
+            df_export.to_csv(export_path, index=False, float_format='%.6f')
+            
+            # Also save summary statistics for the year
+            summary_data = []
+            for result in self.current_results:
+                summary_data.append({
+                    'year': year,
+                    'z_center': result['z_center'],
+                    'cx': result['cx'],
+                    'cy': result['cy'],
+                    'R': result['R'],
+                    'thickness': self.slice_thickness.value(),
+                    'ovality_pct': result.get('ovality_pct', np.nan),
+                    'n_boundary_points': len(result.get('boundary_points', []))
+                })
+            
+            df_summary = pd.DataFrame(summary_data)
+            summary_path = os.path.join(save_dir, f"year_{year}_summary.csv")
+            df_summary.to_csv(summary_path, index=False, float_format='%.6f')
+            
+            self.statusBar().showMessage(
+                f"Year {year} data exported to {save_dir} - {len(export_data)} boundary points"
+            )
+            
+        except Exception as e:
+            self.statusBar().showMessage(f"Error exporting year data: {str(e)}")
 
     def visualize_slice(self):
         if self.points is None:
@@ -1543,17 +1602,26 @@ class CylinderAnalyzerGUI(QMainWindow):
                 print(f"Debug - Error parsing result: {parse_error}")
                 self.statusBar().showMessage(f"Error parsing analysis result: {str(parse_error)}")
                 return
-        
+
             # Validate extracted values
             if R <= 0:
-                self.statusBar().showMessage("Invalid radius calculated - try adjusting parameters")
+                self.statusBar().showMessage("Invalid radius calculated - try increasing parameters")
                 return
-        
+
             print(f"Debug - Final values: xc={xc}, yc={yc}, R={R}, ovality={ovality_pct}")
-        
+
+            # Extract inlier_mask if available
+            inlier_mask = None
+            if isinstance(result_dict, dict) and "inlier_mask" in result_dict:
+                inlier_mask = np.array(result_dict["inlier_mask"], dtype=bool)
+                print(f"Debug - Using inlier mask with {np.sum(inlier_mask)}/{len(inlier_mask)} inliers")
+
             # Clear previous plot
             self.slice_figure.clear()
-            ax = self.slice_figure.add_subplot(111)
+            
+            # Create 1x2 subplots
+            ax1 = self.slice_figure.add_subplot(1, 2, 1)  # Left: XY view
+            ax2 = self.slice_figure.add_subplot(1, 2, 2)  # Right: Residual profile
             
             # Plot points (subsample if too many)
             if len(slice_points) > 30000:
@@ -1562,54 +1630,89 @@ class CylinderAnalyzerGUI(QMainWindow):
             else:
                 plot_points = slice_points
             
-            # Plot points, boundary and fitted circle
-            ax.scatter(plot_points[:, 0], plot_points[:, 1], 
+            # Left subplot: XY view
+            ax1.scatter(plot_points[:, 0], plot_points[:, 1], 
                     s=1, alpha=0.3, label='Points', c='lightblue')
             
             if edge_xy is not None and len(edge_xy) > 0:
-                ax.plot(edge_xy[:, 0], edge_xy[:, 1], 'k-', 
+                ax1.plot(edge_xy[:, 0], edge_xy[:, 1], 'k-', 
                     linewidth=1.5, label='Boundary')
             
             # Plot fitted circle
             theta = np.linspace(0, 2*np.pi, 360)
             circle_x = xc + R*np.cos(theta)
             circle_y = yc + R*np.sin(theta)
-            ax.plot(circle_x, circle_y, 'r-', 
+            ax1.plot(circle_x, circle_y, 'r-', 
                 linewidth=2, label='Fitted Circle')
             
             # Plot center
-            ax.plot(xc, yc, 'r+', markersize=12, markeredgewidth=3, label='Center')
+            ax1.plot(xc, yc, 'r+', markersize=12, markeredgewidth=3, label='Center')
             
-            # Add text with parameters (in meters)
-            info_text = (
-                f"Z = {z_target:.4f} ± {dz:.4f} m\n"
-                f"Points: {len(slice_points):,}\n"
-                f"Edge Points: {len(edge_xy) if edge_xy is not None else 0}\n"
-                f"Center: ({xc:.4f}, {yc:.4f}) m\n"
-                f"Radius: {R:.4f} m\n"
-                f"Ovality: {ovality_pct:.3f}%\n"
-                f"Viz Thickness: {slice_thickness:.3f} m"
-            )
-            ax.text(0.02, 0.98, info_text,
-                transform=ax.transAxes,
-                verticalalignment='top',
-                fontsize=9,
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+            ax1.set_aspect('equal')
+            ax1.grid(True, alpha=0.3)
+            ax1.set_xlabel('X (m)')
+            ax1.set_ylabel('Y (m)')
+            ax1.set_title('XY View')
+            ax1.legend()
             
-            ax.set_aspect('equal')
-            ax.grid(True, alpha=0.3)
-            ax.set_xlabel('X (m)')
-            ax.set_ylabel('Y (m)')
-            ax.set_title(f'Slice Visualization at Z = {z_target:.4f}m (±{dz:.4f}m)')
+            # Right subplot: Residual profile (Δr vs θ)
+            if edge_xy is not None and len(edge_xy) > 0:
+                # Compute residual profile
+                dx = edge_xy[:, 0] - xc
+                dy = edge_xy[:, 1] - yc
+                theta_res = (np.arctan2(dy, dx) + 2 * np.pi) % (2 * np.pi)
+                r = np.hypot(dx, dy)
+                delta_r = r - R
+                
+                # MODIFIED: Filter outliers using inlier_mask or dynamic quantile filtering
+                if inlier_mask is not None and len(inlier_mask) == len(edge_xy):
+                    # Use inlier mask from hybrid fit (preferred)
+                    valid_mask = inlier_mask
+                    print(f"Debug - Filtered to {np.sum(valid_mask)} inlier points")
+                else:
+                    # Fallback: Dynamic outlier filtering using quantile (remove top 5% outliers)
+                    abs_delta_r = np.abs(delta_r)
+                    threshold = np.quantile(abs_delta_r, 0.95)  # 95th percentile as threshold
+                    valid_mask = abs_delta_r <= threshold
+                    print(f"Debug - Fallback filtering: removed {np.sum(~valid_mask)} outliers using quantile threshold {threshold:.3f}")
+                
+                # Apply filtering
+                theta_filtered = theta_res[valid_mask]
+                delta_r_filtered = delta_r[valid_mask]
+                
+                # Sort by theta for smooth plotting
+                order = np.argsort(theta_filtered)
+                theta_sorted = theta_filtered[order]
+                delta_r_sorted = delta_r_filtered[order]
+                
+                # Convert theta from radians to degrees
+                theta_sorted_deg = np.degrees(theta_sorted)
+                
+                # Plot baseline and residuals
+                ax2.axhline(0.0, color='k', linestyle='--', linewidth=1.5, label='Ideal circle (Δr=0)')
+                ax2.plot(theta_sorted_deg, delta_r_sorted, 'b-', linewidth=1, label='Δr = r - R')
+                
+                # Add red dots at each boundary point position
+                ax2.scatter(theta_sorted_deg, delta_r_sorted, color='red', s=8, alpha=0.8, label='Boundary points')
+                
+                # Add info about filtering
+                ax2.text(0.02, 0.98, f'Filtered: {len(theta_sorted)}/{len(edge_xy)} points', 
+                        transform=ax2.transAxes, fontsize=8, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                
+                ax2.set_xlabel('θ (deg)')
+                ax2.set_ylabel('Δr')
+                ax2.set_title('Residual Profile (Outliers Filtered)')
+                ax2.grid(True, alpha=0.3)
+                ax2.set_xticks(np.arange(0, 360, 30))
+                ax2.legend()
+            else:
+                ax2.text(0.5, 0.5, 'No boundary data', ha='center', va='center', transform=ax2.transAxes)
+                ax2.set_title('Residual Profile')
             
-            # Adjust layout before adding legend
+            # Overall title and layout
+            self.slice_figure.suptitle(f'Slice at Z = {z_target:.4f}m (±{dz:.4f}m) - Thickness: {slice_thickness:.3f}m')
             self.slice_figure.tight_layout()
-            
-            # Add legend with better placement
-            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-            
-            # Adjust subplot parameters to fit legend
-            self.slice_figure.subplots_adjust(right=0.85)
             
             self.slice_canvas.draw()
             
@@ -1617,6 +1720,23 @@ class CylinderAnalyzerGUI(QMainWindow):
             self.results_tabs.setCurrentIndex(2)
             
             self.statusBar().showMessage(f"Slice visualization complete - {len(slice_points):,} points, thickness: {slice_thickness:.3f}m")
+            
+            # After successful processing, store the slice result
+            self.current_slice_result = {
+                'z_target': z_target,
+                'slice_thickness': slice_thickness,
+                'xc': xc,
+                'yc': yc,
+                'R': R,
+                'ovality_pct': ovality_pct,
+                'edge_xy': edge_xy,
+                'theta_sorted': theta_sorted if 'theta_sorted' in locals() else None,
+                'delta_r_sorted': delta_r_sorted if 'delta_r_sorted' in locals() else None,
+                'n_points': len(slice_points)
+            }
+            
+            # Enable export slice button
+            self.export_slice_btn.setEnabled(True)
             
         except Exception as e:
             error_msg = str(e)
@@ -1630,6 +1750,7 @@ class CylinderAnalyzerGUI(QMainWindow):
                 self.statusBar().showMessage("Slice processing failed - check data quality and parameters")
             else:
                 self.statusBar().showMessage(f"Error: {error_msg} - try increasing thickness")
+
     def visualize_circular_slices(self):
         """Visualize circular slices in 3D VTK view based on analysis results"""
         if not hasattr(self, 'current_results') or not self.current_results:
@@ -1742,96 +1863,245 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.statusBar().showMessage(f"Visualized {len(self.current_results)} slices along {['X','Y','Z'][main_axis]} axis")
 
     def compare_years(self):
-        # Select CSV files for comparison
-        filenames, _ = QFileDialog.getOpenFileNames(
+        """Compare current slice with data from multiple years' files"""
+        # Check if we have current slice data
+        if not hasattr(self, 'current_slice_result') or self.current_slice_result is None:
+            self.statusBar().showMessage("Please visualize a slice first before comparing")
+            return
+        
+        # Ask for number of years to compare
+        num_years, ok = QInputDialog.getInt(
             self,
-            "Select Results CSV Files for Comparison",
+            "Number of Years",
+            "Enter number of years to compare (minimum 1):",
+            value=1,
+            min=1,
+            max=10
+        )
+        
+        if not ok:
+            return
+        
+        # Create dialog for file selection
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Select Slice Files for {num_years} Years")
+        dialog.setModal(True)
+        
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"Select boundary_data.csv files for {num_years} years:"))
+        
+        # Create file selectors
+        file_buttons = []
+        file_labels = []
+        
+        for i in range(num_years):
+            hbox = QHBoxLayout()
+            label = QLabel(f"Year {i+1}: No file selected")
+            file_labels.append(label)
+            hbox.addWidget(label)
+            
+            btn = QPushButton("Browse...")
+            btn.clicked.connect(lambda checked, idx=i: self.select_comparison_file(idx, file_labels, file_buttons))
+            file_buttons.append(btn)
+            hbox.addWidget(btn)
+            
+            layout.addLayout(hbox)
+        
+        # OK/Cancel buttons
+        button_box = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_box.addWidget(ok_btn)
+        button_box.addWidget(cancel_btn)
+        layout.addLayout(button_box)
+        
+        # Store file paths
+        self.comparison_files = [None] * num_years
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Check if all files selected
+            if None in self.comparison_files:
+                self.statusBar().showMessage("Please select files for all years")
+                return
+            
+            try:
+                # Get current slice parameters
+                current_z = self.current_slice_result['z_target']
+                current_thickness = self.current_slice_result['slice_thickness']
+                
+                # Clear slice figure and create comparison plot
+                self.slice_figure.clear()
+                
+                # Create subplot for residual profiles
+                ax = self.slice_figure.add_subplot(1, 1, 1)
+                
+                # Define colors for different years (including current)
+                colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan', 'magenta']
+                
+                # Plot current slice data first (blue)
+                current_result = self.current_slice_result
+                if current_result['theta_sorted'] is not None and current_result['delta_r_sorted'] is not None:
+                    ax.plot(current_result['theta_sorted'], current_result['delta_r_sorted'], 
+                           color='blue', linewidth=2, label='Current Slice', alpha=0.8)
+                    ax.scatter(current_result['theta_sorted'], current_result['delta_r_sorted'], 
+                              color='blue', s=10, alpha=0.6)
+                
+                # Load and plot each comparison file
+                valid_comparisons = 0
+                for i, file_path in enumerate(self.comparison_files):
+                    try:
+                        df = pd.read_csv(file_path)
+                        
+                        # Validate file format
+                        required_cols = ['year', 'z_center', 'thickness', 'theta', 'delta_r']
+                        if not all(col in df.columns for col in required_cols):
+                            self.statusBar().showMessage(f"Skipping {os.path.basename(file_path)}: invalid format")
+                            continue
+                        
+                        # Filter data for matching z_center and thickness
+                        matching_slices = df[
+                            (np.isclose(df['z_center'], current_z, atol=1e-3)) & 
+                            (np.isclose(df['thickness'], current_thickness, atol=1e-3))
+                        ]
+                        
+                        if matching_slices.empty:
+                            self.statusBar().showMessage(f"Skipping {os.path.basename(file_path)}: no matching slice")
+                            continue
+                        
+                        # Get year from matching data
+                        comparison_year = str(matching_slices['year'].iloc[0])
+                        
+                        # Plot comparison data
+                        comparison_df_sorted = matching_slices.sort_values('theta')
+                        ax.plot(comparison_df_sorted['theta'], comparison_df_sorted['delta_r'], 
+                               color=colors[i+1], linewidth=2, label=f'Year {comparison_year}', alpha=0.8)
+                        ax.scatter(comparison_df_sorted['theta'], comparison_df_sorted['delta_r'], 
+                                  color=colors[i+1], s=10, alpha=0.6)
+                        
+                        valid_comparisons += 1
+                        
+                    except Exception as e:
+                        self.statusBar().showMessage(f"Error loading {os.path.basename(file_path)}: {str(e)}")
+                        continue
+                
+                if valid_comparisons == 0:
+                    self.statusBar().showMessage("No valid comparison data found")
+                    return
+                
+                # Add baseline
+                ax.axhline(0.0, color='k', linestyle='--', linewidth=1.5, label='Ideal circle (Δr=0)')
+                
+                ax.set_xlabel('θ (rad)')
+                ax.set_ylabel('Δr')
+                ax.set_title(f'Residual Profile Comparison - Current vs {valid_comparisons} Years\n'
+                            f'Z: {current_z:.3f}m, Thickness: {current_thickness:.3f}m')
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+                
+                self.slice_figure.tight_layout()
+                self.slice_canvas.draw()
+                
+                # Switch to slice tab
+                self.results_tabs.setCurrentIndex(2)
+                
+                self.statusBar().showMessage(f"Comparison completed - Current slice vs {valid_comparisons} years")
+                
+            except Exception as e:
+                self.statusBar().showMessage(f"Error during comparison: {str(e)}")
+    
+    def select_comparison_file(self, index, labels, buttons):
+        """Select file for comparison"""
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Select Boundary Data File for Year {index + 1}",
             "",
             "CSV Files (*.csv);;All Files (*.*)"
         )
         
-        if not filenames:
+        if filename:
+            self.comparison_files[index] = filename
+            labels[index].setText(f"Year {index + 1}: {os.path.basename(filename)}")
+
+    # NEW: Add method to export current slice data
+    def export_slice(self):
+        """Export data for the current visualized slice"""
+        if not hasattr(self, 'current_slice_result'):
+            self.statusBar().showMessage("No slice data to export")
             return
-            
+        
+        # Get year from user input
+        year, ok = QInputDialog.getText(
+            self,
+            "Enter Year",
+            "Enter the year this data was scanned:",
+            text=str(datetime.now().year)
+        )
+        
+        if not ok or not year.strip():
+            return
+        
         try:
-            # Create separate tab for comparison if not exists
-            if not hasattr(self, 'comparison_tab'):
-                self.comparison_tab = QWidget()
-                self.results_tabs.addTab(self.comparison_tab, "Year Comparison")
-                comparison_layout = QVBoxLayout(self.comparison_tab)
-                
-                # Create separate figure for comparison
-                self.comparison_figure = plt.figure(figsize=(10, 8))
-                self.comparison_canvas = FigureCanvasQTAgg(self.comparison_figure)
-                comparison_layout.addWidget(self.comparison_canvas)
+            year = year.strip()
             
-            # Load and combine data
-            all_data = []
-            for filename in filenames:
-                # Extract year from filename
-                year = os.path.basename(filename).split('_')[0]
-                
-                # Load CSV
-                df = pd.read_csv(filename)
-                df['Year'] = year  # Add year column
-                all_data.append(df)
+            # Get directory to save files
+            save_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Select Directory to Save Slice Data",
+                "",
+                QFileDialog.Option.ShowDirsOnly
+            )
             
-            # Combine all dataframes
-            combined_df = pd.concat(all_data, ignore_index=True)
+            if not save_dir:
+                return
             
-            # Clear comparison plots
-            self.comparison_figure.clear()
+            result = self.current_slice_result
             
-            # Plot 1: Ovality vs Z for different years
-            ax1 = self.comparison_figure.add_subplot(211)
-            for year in combined_df['Year'].unique():
-                year_data = combined_df[combined_df['Year'] == year]
-                ax1.plot(year_data['z_center'], year_data['ovality_pct'], 
-                        '-o', label=f'Year {year}', markersize=4)
+            # Prepare boundary data for export
+            export_data = []
             
-            ax1.set_xlabel('Z Position')
-            ax1.set_ylabel('Ovality %')
-            ax1.grid(True)
-            ax1.legend()
-            ax1.set_title('Ovality Comparison')
+            if result['edge_xy'] is not None and len(result['edge_xy']) > 0 and result['theta_sorted'] is not None and result['delta_r_sorted'] is not None:
+                # Create rows for each boundary point
+                for i, (theta_val, delta_r_val) in enumerate(zip(result['theta_sorted'], result['delta_r_sorted'])):
+                    export_data.append({
+                        'year': year,
+                        'z_center': result['z_target'],
+                        'cx': result['xc'],
+                        'cy': result['yc'],
+                        'R': result['R'],
+                        'thickness': result['slice_thickness'],
+                        'theta': theta_val,
+                        'delta_r': delta_r_val,
+                        'boundary_point_index': i
+                    })
+            else:
+                # If no boundary points, still export slice info with NaN delta_r
+                export_data.append({
+                    'year': year,
+                    'z_center': result['z_target'],
+                    'cx': result['xc'],
+                    'cy': result['yc'],
+                    'R': result['R'],
+                    'thickness': result['slice_thickness'],
+                    'theta': np.nan,
+                    'delta_r': np.nan,
+                    'boundary_point_index': 0
+                })
             
-            # Plot 2: Radius vs Z for different years
-            ax2 = self.comparison_figure.add_subplot(212)
-            for year in combined_df['Year'].unique():
-                year_data = combined_df[combined_df['Year'] == year]
-                ax2.plot(year_data['z_center'], year_data['R'], 
-                        '-o', label=f'Year {year}', markersize=4)
+            # Create DataFrame and save
+            df_export = pd.DataFrame(export_data)
+            export_path = os.path.join(save_dir, f"slice_{year}_{result['z_target']:.3f}m_{result['slice_thickness']:.3f}m_boundary_data.csv")
+            df_export.to_csv(export_path, index=False, float_format='%.6f')
             
-            ax2.set_xlabel('Z Position')
-            ax2.set_ylabel('Radius')
-            ax2.grid(True)
-            ax2.legend()
-            ax2.set_title('Radius Comparison')
-            
-            self.comparison_figure.tight_layout()
-            self.comparison_canvas.draw()
-            
-            # Switch to comparison tab
-            comparison_tab_index = self.results_tabs.indexOf(self.comparison_tab)
-            self.results_tabs.setCurrentIndex(comparison_tab_index)
-            
-            # Create comparison statistics
-            stats_text = "Comparison Statistics:\n\n"
-            for year in combined_df['Year'].unique():
-                year_data = combined_df[combined_df['Year'] == year]
-                stats_text += f"Year {year}:\n"
-                stats_text += f"  Mean Ovality: {year_data['ovality_pct'].mean():.3f}%\n"
-                stats_text += f"  Max Ovality: {year_data['ovality_pct'].max():.3f}%\n"
-                stats_text += f"  Mean Radius: {year_data['R'].mean():.3f}\n"
-                stats_text += f"  Radius Range: {year_data['R'].max() - year_data['R'].min():.3f}\n\n"
-            
-            # Update stats label
-            self.stats_label.setText(stats_text)
-            
-            self.statusBar().showMessage("Comparison completed successfully")
+            self.statusBar().showMessage(
+                f"Slice data exported to {save_dir} - {len(export_data)} boundary points"
+            )
             
         except Exception as e:
-            self.statusBar().showMessage(f"Error comparing data: {str(e)}")
+            self.statusBar().showMessage(f"Error exporting slice data: {str(e)}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
