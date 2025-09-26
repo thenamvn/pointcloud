@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                             QSpinBox, QDoubleSpinBox, QComboBox, QProgressBar,
                             QTableWidget, QTableWidgetItem, QTabWidget, QSplitter, QCheckBox, QInputDialog)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QElapsedTimer
 import vtk
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from analyzer import CylinderAnalyzer, Config
@@ -233,7 +233,6 @@ class CylinderAnalyzerGUI(QMainWindow):
         param_layout.addWidget(self.z_max_input)
 
         self.z_step = QDoubleSpinBox()
-        self.z_step.setRange(0.0001, 0.05)  # 0.1mm to 50mm in meters
         self.z_step.setValue(2)  # 2 in meters
         self.z_step.setSingleStep(0.1)  # 0.1mm in meters
         self.z_step.setDecimals(4)  # Show 4 decimal places for meters
@@ -244,7 +243,6 @@ class CylinderAnalyzerGUI(QMainWindow):
         
         # Add slice thickness control
         self.slice_thickness = QDoubleSpinBox()
-        self.slice_thickness.setRange(0.001, 0.05)  # 1mm to 50mm in meters
         self.slice_thickness.setValue(0.5)  # 5mm default
         self.slice_thickness.setSingleStep(0.1)
         self.slice_thickness.setDecimals(4)
@@ -374,6 +372,10 @@ class CylinderAnalyzerGUI(QMainWindow):
         compare_btn = QPushButton("Compare with Other Years")
         compare_btn.clicked.connect(self.compare_years)
         control_layout.addWidget(compare_btn)
+        
+        # Add processing time label
+        self.processing_time_label = QLabel("Processing Time: --")
+        control_layout.addWidget(self.processing_time_label)
         
         # Add tabs for results
         self.results_tabs = QTabWidget()
@@ -575,6 +577,9 @@ class CylinderAnalyzerGUI(QMainWindow):
             self.export_btn.setEnabled(False)
             self.export_year_btn.setEnabled(False)  # NEW: Disable export year button
             self.export_slice_btn.setEnabled(False)  # NEW: Disable export slice button
+            
+            # Reset processing time
+            self.processing_time_label.setText("Processing Time: --")
             
             # Force garbage collection
             import gc
@@ -1022,6 +1027,10 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         
+        # Start processing timer
+        self.processing_timer = QElapsedTimer()
+        self.processing_timer.start()
+        
         # Create and start worker thread
         self.worker = AnalysisWorker(self.points, params)
         self.worker.progress.connect(self.update_progress)
@@ -1033,6 +1042,7 @@ class CylinderAnalyzerGUI(QMainWindow):
     def analysis_error(self, error_msg):
         self.setEnabled(True)
         self.progress_bar.setVisible(False)
+        self.processing_time_label.setText("Processing Time: --")
         self.statusBar().showMessage(f"Error during analysis: {error_msg}")
     
     def update_progress(self, value):
@@ -1042,6 +1052,10 @@ class CylinderAnalyzerGUI(QMainWindow):
     def analysis_finished(self, results):
         self.setEnabled(True)
         self.progress_bar.setVisible(False)
+        
+        # Stop timer and calculate elapsed time
+        elapsed_ms = self.processing_timer.elapsed()
+        elapsed_sec = elapsed_ms / 1000.0
         
         if results["status"] == "success":
             self.current_results = results["results"]
@@ -1058,7 +1072,11 @@ class CylinderAnalyzerGUI(QMainWindow):
                 self.statusBar().showMessage(f"Analysis completed - {len(self.current_results)} slices visualized in both 2D and 3D")
             else:
                 self.statusBar().showMessage(f"Analysis completed - {len(self.current_results)} slices visualized in 2D plots")
+            
+            # Update processing time label
+            self.processing_time_label.setText(f"Processing Time: {elapsed_sec:.2f}s")
         else:
+            self.processing_time_label.setText("Processing Time: --")
             self.statusBar().showMessage("Analysis failed")
 
     # NEW: Add method to compute residual profile
@@ -1229,6 +1247,9 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.results_tabs.setCurrentIndex(1)  # Switch to Plots tab
         
         self.statusBar().showMessage(f"All {max_plots} slices visualized in Plots tab (Thickness: {slice_thickness:.3f}m)")
+        #open file explorer to show pdf
+        if pdf_path:
+            os.startfile(os.path.dirname(pdf_path))
 
     def display_results(self, results):
         # Update table with all columns

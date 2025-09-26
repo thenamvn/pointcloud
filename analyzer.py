@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
+import concurrent.futures  # Added for multithreading
 
 from utils.data_io import load_txt_points, save_results  # Modified imports
 from utils.circle_fitting import fit_circle_pratt, lm_circle_geometric, fit_circle_hybrid_at_z  # MODIFIED: Import hybrid fit
@@ -179,7 +180,7 @@ class CylinderAnalyzer:
     
     def analyze_with_progress(self, points: np.ndarray, progress_callback=None):
         """
-        Analyze points with progress reporting
+        Analyze points with progress reporting using multithreading
         """
         if not isinstance(points, np.ndarray):
             points = np.array(points)
@@ -198,26 +199,33 @@ class CylinderAnalyzer:
         z_centers = self.calculate_z_centers(points)
         total = len(z_centers)
 
-        for i, zc in enumerate(z_centers):
-            dz = self.config.z_step / 2.0
-            mask = (points[:, 2] >= zc - dz) & (points[:, 2] <= zc + dz)
-            slice_points = points[mask]
+        # Use ThreadPoolExecutor with CPU-scaled thread count
+        max_workers = os.cpu_count()  # Scale according to available CPU cores
+        print(f"Using {max_workers} threads for analysis...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all slice processing tasks
+            future_to_zc = {executor.submit(self.process_slice, points, zc): zc for zc in z_centers}
             
-            if len(slice_points) < self.config.min_points_per_slice:
-                continue
+            completed_count = 0
+            for future in concurrent.futures.as_completed(future_to_zc):
+                zc = future_to_zc[future]
+                try:
+                    result_tuple, edge_df, warn = future.result()
+                    if result_tuple is not None:
+                        result_dict, _, _, _, _ = result_tuple  # Unpack the tuple
+                        results.append(result_dict)  # Append only the dictionary
+                except Exception as e:
+                    print(f"Error processing slice at z={zc}: {str(e)}")
+                    continue
 
-            try:
-                result_tuple, edge_df, warn = self.process_slice(slice_points, zc)
-                if result_tuple is not None:
-                    result_dict, _, _, _, _ = result_tuple  # Unpack the tuple
-                    results.append(result_dict)  # Append only the dictionary
-            except Exception as e:
-                print(f"Error processing slice at z={zc}: {str(e)}")
-                continue
+                # Update progress
+                completed_count += 1
+                progress = int(completed_count / total * 100)
+                if progress_callback:
+                    progress_callback(progress)
 
-            if progress_callback:
-                progress = int((i + 1) / total * 100)
-                progress_callback(progress)
+        # Sort results by z_center to maintain order
+        results.sort(key=lambda x: x['z_center'])
 
         return results  # Now returns list of dictionaries
 
