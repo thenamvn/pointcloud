@@ -14,6 +14,7 @@ import pandas as pd
 import os
 from datetime import datetime
 import concurrent.futures
+
 class AnalysisWorker(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(dict)
@@ -114,7 +115,7 @@ class LoadPointCloudWorker(QThread):
                 except ValueError:
                     continue
         return points
-    
+
 class CylinderAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -397,6 +398,10 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.stats_label = QLabel()
         control_layout.addWidget(self.stats_label)
 
+        # Initialize timing variables
+        self.load_time = 0.0
+        self.analyze_time = 0.0
+
     def on_quality_changed(self, quality_text):
         """Handle quality dropdown change"""
         quality_map = {
@@ -506,6 +511,8 @@ class CylinderAnalyzerGUI(QMainWindow):
             
             # Reset processing time
             self.processing_time_label.setText("Processing Time: --")
+            self.load_time = 0.0
+            self.analyze_time = 0.0
             
             # Force garbage collection
             import gc
@@ -528,6 +535,10 @@ class CylinderAnalyzerGUI(QMainWindow):
                 self.statusBar().showMessage(f"Loading single file: {os.path.basename(filenames[0])}...")
             else:
                 self.statusBar().showMessage(f"Loading and combining {len(filenames)} files...")
+            
+            # Start loading timer
+            self.load_timer = QElapsedTimer()
+            self.load_timer.start()
             
             self.start_incremental_loading(filenames)
 
@@ -674,6 +685,13 @@ class CylinderAnalyzerGUI(QMainWindow):
         if hasattr(self, 'current_load_worker'):
             del self.current_load_worker
         
+        # Stop load timer and record time
+        load_elapsed = self.load_timer.elapsed() / 1000.0
+        self.load_time = load_elapsed
+        
+        # Update processing time label
+        self.update_processing_time_label()
+        
         # Update UI if we have data
         if hasattr(self, 'points') and self.points is not None:
             self.update_ui_after_load()
@@ -682,7 +700,7 @@ class CylinderAnalyzerGUI(QMainWindow):
             final_memory_mb = self.points.nbytes / (1024*1024)
             self.statusBar().showMessage(
                 f"Incremental loading complete! Loaded {self.files_loaded}/{self.total_files} files. "
-                f"Total: {len(self.points):,} points ({final_memory_mb:.0f}MB)"
+                f"Total: {len(self.points):,} points ({final_memory_mb:.0f}MB) - Load time: {load_elapsed:.2f}s"
             )
         else:
             self.statusBar().showMessage("No data loaded")
@@ -692,71 +710,6 @@ class CylinderAnalyzerGUI(QMainWindow):
         # Clean up
         if hasattr(self, 'files_to_load'):
             del self.files_to_load
-
-    def load_finished(self, result):
-        """Backup method for single file loading (kept for compatibility)"""
-        new_points, num_new_points = result
-        
-        # Handle append vs replace mode (same logic as before)
-        if hasattr(self, 'append_mode') and self.append_mode and hasattr(self, 'points') and self.points is not None:
-            # Append mode logic (same as before)
-            old_count = len(self.points)
-            old_memory_mb = self.points.nbytes / (1024*1024)
-            new_memory_mb = new_points.nbytes / (1024*1024)
-            total_memory_mb = old_memory_mb + new_memory_mb
-            
-            if total_memory_mb > 4000:  # 4GB warning
-                from PyQt6.QtWidgets import QMessageBox
-                reply = QMessageBox.warning(
-                    self,
-                    "Memory Warning",
-                    f"Combined data will use ~{total_memory_mb:.0f}MB RAM\n"
-                    f"Current: {old_memory_mb:.0f}MB + New: {new_memory_mb:.0f}MB\n\n"
-                    f"This may cause performance issues. Continue?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No
-                )
-                
-                if reply == QMessageBox.StandardButton.No:
-                    self.statusBar().showMessage("Loading cancelled due to memory concerns")
-                    return
-            try:
-                combined_points = np.vstack([self.points, new_points])
-                del self.points
-                del new_points
-                import gc
-                gc.collect()
-                
-                self.points = combined_points
-                total_points = len(self.points)
-                
-                self.statusBar().showMessage(f"Appended {num_new_points:,} points. Total: {total_points:,} points (was {old_count:,})")
-                
-            except MemoryError:
-                self.statusBar().showMessage("Not enough memory to combine point clouds")
-                self.progress_bar.setVisible(False)
-                self.setEnabled(True)
-                return
-            except Exception as e:
-                self.statusBar().showMessage(f"Error combining data: {str(e)}")
-                self.progress_bar.setVisible(False)
-                self.setEnabled(True)
-                return
-        else:
-            # Replace mode
-            if hasattr(self, 'points') and self.points is not None:
-                del self.points
-                import gc
-                gc.collect()
-            
-            self.points = new_points
-            self.statusBar().showMessage(f"Loaded {num_new_points:,} points")
-        
-        # Update UI
-        self.update_ui_after_load()
-        
-        final_memory_mb = self.points.nbytes / (1024*1024)
-        self.statusBar().showMessage(f"Ready - {len(self.points):,} points ({final_memory_mb:.0f}MB)")
 
     def update_ui_after_load(self):
         """Update UI elements after loading data"""
@@ -982,6 +935,10 @@ class CylinderAnalyzerGUI(QMainWindow):
         # Stop timer and calculate elapsed time
         elapsed_ms = self.processing_timer.elapsed()
         elapsed_sec = elapsed_ms / 1000.0
+        self.analyze_time = elapsed_sec
+        
+        # Update processing time label
+        self.update_processing_time_label()
         
         if results["status"] == "success":
             self.current_results = results["results"]
@@ -999,11 +956,17 @@ class CylinderAnalyzerGUI(QMainWindow):
             else:
                 self.statusBar().showMessage(f"Analysis completed - {len(self.current_results)} slices visualized in 2D plots")
             
-            # Update processing time label
-            self.processing_time_label.setText(f"Processing Time: {elapsed_sec:.2f}s")
+            # Update status with analyze time
+            self.statusBar().showMessage(f"Analysis completed - {len(self.current_results)} slices in {elapsed_sec:.2f}s")
         else:
             self.processing_time_label.setText("Processing Time: --")
             self.statusBar().showMessage("Analysis failed")
+
+    def update_processing_time_label(self):
+        """Update the processing time label with load and analyze times"""
+        load_str = f"Load: {self.load_time:.2f}s" if self.load_time > 0 else "Load: --"
+        analyze_str = f"Analyze: {self.analyze_time:.2f}s" if self.analyze_time > 0 else "Analyze: --"
+        self.processing_time_label.setText(f"Processing Time: {load_str}, {analyze_str}")
 
     # NEW: Add method to compute residual profile
     def compute_residual_profile(self, result):
