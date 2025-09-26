@@ -13,7 +13,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import pandas as pd
 import os
 from datetime import datetime
-
+import concurrent.futures
 class AnalysisWorker(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(dict)
@@ -46,147 +46,73 @@ class LoadPointCloudWorker(QThread):
         
     def run(self):
         try:
-            # Read file in chunks to show progress
-            total_lines = sum(1 for _ in open(self.filename))
-            points = []
+            # Count total lines first for progress calculation
+            with open(self.filename, 'r') as f:
+                total_lines = sum(1 for _ in f)
             
-            with open(self.filename) as f:
-                for i, line in enumerate(f):
-                    # Skip comments and empty lines
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        try:
-                            coords = [float(x) for x in line.replace(',', ' ').split()]
-                            if len(coords) >= 3:
-                                points.append(coords[:3])
-                        except ValueError:
-                            continue
+            # Determine chunk size for multithreaded parsing
+            chunk_size = min(50000, max(10000, total_lines // 4))  # Adaptive chunk size
+            
+            # Read file in chunks and parse with multithreading
+            all_points = []
+            processed_lines = 0
+            
+            with open(self.filename, 'r') as f:
+                while True:
+                    # Read chunk of lines
+                    lines = []
+                    for _ in range(chunk_size):
+                        line = f.readline()
+                        if not line:
+                            break
+                        lines.append(line)
                     
-                    # Update progress every 1000 lines
-                    if i % 1000 == 0:
-                        progress = int((i + 1) / total_lines * 100)
-                        self.progress.emit(progress)
+                    if not lines:
+                        break
+                    
+                    max_workers = os.cpu_count()  # Scale according to CPU cores
+                    # Parse chunk with multithreading
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        # Split lines into sub-chunks for parallel processing
+                        sub_chunk_size = max(1, len(lines) // max_workers)
+                        sub_chunks = [lines[i:i + sub_chunk_size] for i in range(0, len(lines), sub_chunk_size)]
+                        
+                        # Submit parsing tasks
+                        futures = [executor.submit(self.parse_lines_chunk, sub_chunk) for sub_chunk in sub_chunks]
+                        
+                        # Collect results
+                        for future in concurrent.futures.as_completed(futures):
+                            try:
+                                chunk_points = future.result()
+                                all_points.extend(chunk_points)
+                            except Exception as e:
+                                print(f"Error parsing chunk: {e}")
+                                continue
+                    
+                    # Update progress
+                    processed_lines += len(lines)
+                    progress = int((processed_lines / total_lines) * 100)
+                    self.progress.emit(progress)
             
-            points = np.array(points)
+            # Convert to numpy array
+            points = np.array(all_points)
             self.finished.emit((points, len(points)))
             
         except Exception as e:
             self.error.emit(str(e))
-
-class LoadMultiplePointCloudWorker(QThread):
-    progress = pyqtSignal(int)
-    finished = pyqtSignal(tuple)
-    error = pyqtSignal(str)
     
-    def __init__(self, filenames):
-        super().__init__()
-        self.filenames = filenames
-        
-    def run(self):
-        try:
-            all_points = []
-            total_files = len(self.filenames)
-            
-            for file_idx, filename in enumerate(self.filenames):
-                # Calculate base progress for this file
-                base_progress = int((file_idx / total_files) * 90)
-                file_progress_range = int(90 / total_files)  # Each file gets portion of 90%
-                
-                try:
-                    # Parse each file with progress tracking
-                    file_points = self.parse_file_with_progress(filename, base_progress, file_progress_range)
-                    
-                    if len(file_points) == 0:
-                        print(f"Warning: No valid points found in {filename}")
-                        continue
-                        
-                    all_points.extend(file_points)
-                    print(f"Loaded {len(file_points):,} points from {os.path.basename(filename)}")
-                    
-                except Exception as e:
-                    self.error.emit(f"Error reading {filename}: {str(e)}")
-                    return
-                
-                # Update progress after each file
-                self.progress.emit(int(((file_idx + 1) / total_files) * 90))
-            
-            self.progress.emit(95)
-            
-            if len(all_points) == 0:
-                self.error.emit("No points loaded from any file")
-                return
-                
-            # Convert to numpy array
-            points = np.array(all_points, dtype=np.float64)
-            
-            # Validate and clean data
-            if points.shape[1] < 3:
-                self.error.emit("Points must have at least 3 coordinates (X, Y, Z)")
-                return
-                
-            # Take only first 3 columns and remove invalid points
-            points = points[:, :3]
-            valid_mask = np.all(np.isfinite(points), axis=1)
-            points = points[valid_mask]
-            
-            if len(points) == 0:
-                self.error.emit("No valid points after filtering")
-                return
-            
-            self.progress.emit(100)
-            self.finished.emit((points, len(points)))
-            
-        except Exception as e:
-            self.error.emit(f"Unexpected error: {str(e)}")
-    
-    def parse_file_with_progress(self, filename, base_progress, progress_range):
-        """Parse single file with progress updates"""
+    def parse_lines_chunk(self, lines):
+        """Parse a chunk of lines into points"""
         points = []
-        
-        try:
-            # Try pandas for CSV files first
-            if filename.lower().endswith('.csv'):
-                import pandas as pd
-                df = pd.read_csv(filename)
-                if len(df.columns) >= 3:
-                    return df.iloc[:, :3].values.tolist()
-        except:
-            pass
-        
-        # Manual parsing for text files with progress
-        try:
-            # Count total lines first for progress calculation
-            with open(filename, 'r') as f:
-                total_lines = sum(1 for _ in f)
-            
-            # Parse with progress every 5000 lines to avoid too frequent updates
-            with open(filename, 'r') as f:
-                for line_num, line in enumerate(f):
-                    line = line.strip()
-                    
-                    # Skip empty lines and comments
-                    if not line or line.startswith('#') or line.startswith('//'):
-                        continue
-                    
-                    try:
-                        # Handle different separators
-                        line = line.replace(',', ' ').replace(';', ' ').replace('\t', ' ')
-                        coords = [float(x) for x in line.split() if x]
-                        
-                        if len(coords) >= 3:
-                            points.append(coords[:3])
-                            
-                    except ValueError:
-                        continue
-                    
-                    # Update progress every 5000 lines to avoid too frequent updates
-                    if line_num % 5000 == 0 and total_lines > 0:
-                        file_progress = int((line_num / total_lines) * progress_range)
-                        self.progress.emit(base_progress + file_progress)
-        
-        except Exception as e:
-            print(f"Error parsing {filename}: {e}")
-            
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                try:
+                    coords = [float(x) for x in line.replace(',', ' ').split()]
+                    if len(coords) >= 3:
+                        points.append(coords[:3])
+                except ValueError:
+                    continue
         return points
     
 class CylinderAnalyzerGUI(QMainWindow):
