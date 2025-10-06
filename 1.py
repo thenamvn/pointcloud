@@ -262,3 +262,138 @@ def visualize_hybrid_fit(res: Optional[Dict[str,np.ndarray]]):
     plt.legend()
     plt.tight_layout()
     plt.show()
+import h5py
+
+h5_path     = r"C:\Users\MAY02\Desktop\Final\Data\all_pointclouds.h5"
+ds_name     = "all_points"          # hoặc dataset cụ thể
+z_elevation = -25.7951
+z_tolerance = 0.10
+
+with h5py.File(h5_path, "r") as h5f:
+    pts = h5f[ds_name][:]  # (N,3)
+
+res = fit_circle_hybrid_at_z(
+    pts, z_elevation, z_tolerance,
+    inlier_tol=0.5,          # ngưỡng sai số bán kính cho RANSAC (đơn vị XY)
+    max_trials=5000,         # tăng nếu cung quan sát mỏng/ít điểm
+    min_inliers_frac=0.1,    # yêu cầu tối thiểu % inliers trong candidate set
+    r_range=None,            # (rmin, rmax) nếu bạn biết khoảng bán kính
+    huber_delta=1.5,         # robust hơn nếu nhiễu lớn
+    use_hull_vertices_only=True  # dùng riêng các đỉnh hull làm candidate
+)
+
+visualize_hybrid_fit(res)
+
+if res is not None:
+    print({"cx": res["center_x"], "cy": res["center_y"], "R": res["radius"]})
+# ====== Add: unwrap & compare hull/all points vs fitted circle ======
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.spatial import ConvexHull
+from scipy.spatial.qhull import QhullError
+
+def _has_enough_2d_variation(xy, eps=1e-12):
+    if xy.shape[0] < 3: return False
+    xc = xy - xy.mean(axis=0, keepdims=True)
+    _, s, _ = np.linalg.svd(xc, full_matrices=False)
+    return s[1] > eps * (s[0] + eps)
+
+def residual_profile_at_z(points_xyz, res_fit, z_elevation, z_tolerance,
+                          use_hull_vertices=True):
+    """
+    Tạo profile Δr theo θ tại lát Z (unwrap “đường tròn thành đường thẳng”).
+    - use_hull_vertices=True: chỉ dùng đỉnh hull (điểm ngoài cùng)
+      False: dùng toàn bộ điểm lát cắt.
+    Trả về dict: {theta, delta_r, xy_used, cx, cy, R}
+    """
+    cx = float(res_fit["center_x"]); cy = float(res_fit["center_y"]); R = float(res_fit["radius"])
+    z = points_xyz[:,2]
+    m = (z >= z_elevation - z_tolerance) & (z <= z_elevation + z_tolerance)
+    if not np.any(m):
+        return None
+
+    xy = points_xyz[m,:2].astype(float, copy=False)
+    if xy.shape[0] < 3:
+        return None
+    xy = np.unique(xy, axis=0)
+
+    # chọn tập dùng so sánh: hull hay all
+    xy_used = xy
+    if use_hull_vertices and _has_enough_2d_variation(xy):
+        try:
+            hull = ConvexHull(xy)
+            hv = xy[hull.vertices]
+            if hv.shape[0] >= 3:
+                xy_used = hv
+        except QhullError:
+            pass
+
+    # unwrap -> theta, delta_r
+    dx = xy_used[:,0] - cx
+    dy = xy_used[:,1] - cy
+    theta = (np.arctan2(dy, dx) + 2*np.pi) % (2*np.pi)
+    r = np.hypot(dx, dy)
+    delta_r = r - R
+
+    # sắp theo θ để vẽ mạch lạc
+    order = np.argsort(theta)
+    return {
+        "theta": theta[order],
+        "delta_r": delta_r[order],
+        "xy_used": xy_used[order],
+        "cx": cx, "cy": cy, "R": R
+    }
+
+def plot_residual_profile(profile, title_suffix=""):
+    """Vẽ baseline y=0 (đường tròn lý tưởng trải phẳng) + Δr (dữ liệu)."""
+    theta = profile["theta"]; dr = profile["delta_r"]
+    cx, cy, R = profile["cx"], profile["cy"], profile["R"]
+    xy_used = profile["xy_used"]
+
+    plt.figure(figsize=(13,5))
+
+    # (1) XY view: điểm dùng so sánh + đường tròn fit (tham chiếu)
+    ax1 = plt.subplot(1,2,1)
+    ax1.scatter(xy_used[:,0], xy_used[:,1], s=8, alpha=0.7, label=f"Used points (n={len(xy_used)})")
+    th = np.linspace(0, 2*np.pi, 720, endpoint=False)
+    ax1.plot(cx + R*np.cos(th), cy + R*np.sin(th), lw=2, label=f"Fitted circle R={R:.4f}")
+    ax1.scatter([cx],[cy], c="red", s=40, label="Center")
+    ax1.set_aspect("equal"); ax1.set_xlabel("X"); ax1.set_ylabel("Y")
+    ax1.set_title("XY (reference)")
+    ax1.legend()
+
+    # (2) Unwrap: Δr vs θ với baseline y=0 (đường thẳng)
+    ax2 = plt.subplot(1,2,2)
+    ax2.axhline(0.0, color="k", linewidth=1.5, linestyle="--", label="baseline (ideal circle)")
+    ax2.plot(theta, dr, lw=1.5, label="Δr = r - R")
+    ax2.set_xlabel("θ (rad)")
+    ax2.set_ylabel("Δr")
+    ttl = "Residual vs θ"
+    if title_suffix:
+        ttl += f" | {title_suffix}"
+    ax2.set_title(ttl)
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+# ====== GỌI CHẠY SAU KHI CÓ 'res' ======
+if res is not None:
+    # True => chỉ dùng đỉnh hull (điểm ngoài cùng); False => dùng toàn bộ điểm lát cắt
+    prof = residual_profile_at_z(pts, res, z_elevation, z_tolerance,
+                                 use_hull_vertices=True)
+    if prof is None:
+        print("Không có đủ điểm/hull degenerate tại lát Z này.")
+    else:
+        # vẽ baseline (đường thẳng) và đường Δr (lên/xuống so với đường tròn fit)
+        title = f"Z={z_elevation}±{z_tolerance} | hull only"
+        plot_residual_profile(prof, title_suffix=title)
+
+        # (tuỳ chọn) so sánh cả trường hợp dùng toàn bộ điểm lát cắt:
+        prof_all = residual_profile_at_z(pts, res, z_elevation, z_tolerance,
+                                         use_hull_vertices=False)
+        if prof_all is not None:
+            plot_residual_profile(prof_all, title_suffix=f"Z={z_elevation}±{z_tolerance} | all slice points")
+else:
+    print("No fit (res is None).")

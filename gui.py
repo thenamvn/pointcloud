@@ -3,16 +3,17 @@ import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                             QSpinBox, QDoubleSpinBox, QComboBox, QProgressBar,
-                            QTableWidget, QTableWidgetItem, QTabWidget, QSplitter, QCheckBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
+                            QTableWidget, QTableWidgetItem, QTabWidget, QSplitter, QCheckBox, QInputDialog)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QElapsedTimer
 import vtk
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from analyzer import CylinderAnalyzer, Config
-from utils.data_io import load_txt_points
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import pandas as pd
 import os
+from datetime import datetime
+import concurrent.futures
 
 class AnalysisWorker(QThread):
     progress = pyqtSignal(int)
@@ -46,149 +47,75 @@ class LoadPointCloudWorker(QThread):
         
     def run(self):
         try:
-            # Read file in chunks to show progress
-            total_lines = sum(1 for _ in open(self.filename))
-            points = []
+            # Count total lines first for progress calculation
+            with open(self.filename, 'r') as f:
+                total_lines = sum(1 for _ in f)
             
-            with open(self.filename) as f:
-                for i, line in enumerate(f):
-                    # Skip comments and empty lines
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        try:
-                            coords = [float(x) for x in line.replace(',', ' ').split()]
-                            if len(coords) >= 3:
-                                points.append(coords[:3])
-                        except ValueError:
-                            continue
+            # Determine chunk size for multithreaded parsing
+            chunk_size = min(50000, max(10000, total_lines // 4))  # Adaptive chunk size
+            
+            # Read file in chunks and parse with multithreading
+            all_points = []
+            processed_lines = 0
+            
+            with open(self.filename, 'r') as f:
+                while True:
+                    # Read chunk of lines
+                    lines = []
+                    for _ in range(chunk_size):
+                        line = f.readline()
+                        if not line:
+                            break
+                        lines.append(line)
                     
-                    # Update progress every 1000 lines
-                    if i % 1000 == 0:
-                        progress = int((i + 1) / total_lines * 100)
-                        self.progress.emit(progress)
+                    if not lines:
+                        break
+                    
+                    max_workers = os.cpu_count()  # Scale according to CPU cores
+                    # Parse chunk with multithreading
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        # Split lines into sub-chunks for parallel processing
+                        sub_chunk_size = max(1, len(lines) // max_workers)
+                        sub_chunks = [lines[i:i + sub_chunk_size] for i in range(0, len(lines), sub_chunk_size)]
+                        
+                        # Submit parsing tasks
+                        futures = [executor.submit(self.parse_lines_chunk, sub_chunk) for sub_chunk in sub_chunks]
+                        
+                        # Collect results
+                        for future in concurrent.futures.as_completed(futures):
+                            try:
+                                chunk_points = future.result()
+                                all_points.extend(chunk_points)
+                            except Exception as e:
+                                print(f"Error parsing chunk: {e}")
+                                continue
+                    
+                    # Update progress
+                    processed_lines += len(lines)
+                    progress = int((processed_lines / total_lines) * 100)
+                    self.progress.emit(progress)
             
-            points = np.array(points)
+            # Convert to numpy array
+            points = np.array(all_points)
             self.finished.emit((points, len(points)))
             
         except Exception as e:
             self.error.emit(str(e))
-
-class LoadMultiplePointCloudWorker(QThread):
-    progress = pyqtSignal(int)
-    finished = pyqtSignal(tuple)
-    error = pyqtSignal(str)
     
-    def __init__(self, filenames):
-        super().__init__()
-        self.filenames = filenames
-        
-    def run(self):
-        try:
-            all_points = []
-            total_files = len(self.filenames)
-            
-            for file_idx, filename in enumerate(self.filenames):
-                # Calculate base progress for this file
-                base_progress = int((file_idx / total_files) * 90)
-                file_progress_range = int(90 / total_files)  # Each file gets portion of 90%
-                
-                try:
-                    # Parse each file with progress tracking
-                    file_points = self.parse_file_with_progress(filename, base_progress, file_progress_range)
-                    
-                    if len(file_points) == 0:
-                        print(f"Warning: No valid points found in {filename}")
-                        continue
-                        
-                    all_points.extend(file_points)
-                    print(f"Loaded {len(file_points):,} points from {os.path.basename(filename)}")
-                    
-                except Exception as e:
-                    self.error.emit(f"Error reading {filename}: {str(e)}")
-                    return
-                
-                # Update progress after each file
-                self.progress.emit(int(((file_idx + 1) / total_files) * 90))
-            
-            self.progress.emit(95)
-            
-            if len(all_points) == 0:
-                self.error.emit("No points loaded from any file")
-                return
-                
-            # Convert to numpy array
-            points = np.array(all_points, dtype=np.float64)
-            
-            # Validate and clean data
-            if points.shape[1] < 3:
-                self.error.emit("Points must have at least 3 coordinates (X, Y, Z)")
-                return
-                
-            # Take only first 3 columns and remove invalid points
-            points = points[:, :3]
-            valid_mask = np.all(np.isfinite(points), axis=1)
-            points = points[valid_mask]
-            
-            if len(points) == 0:
-                self.error.emit("No valid points after filtering")
-                return
-            
-            self.progress.emit(100)
-            self.finished.emit((points, len(points)))
-            
-        except Exception as e:
-            self.error.emit(f"Unexpected error: {str(e)}")
-    
-    def parse_file_with_progress(self, filename, base_progress, progress_range):
-        """Parse single file with progress updates"""
+    def parse_lines_chunk(self, lines):
+        """Parse a chunk of lines into points"""
         points = []
-        
-        try:
-            # Try pandas for CSV files first
-            if filename.lower().endswith('.csv'):
-                import pandas as pd
-                df = pd.read_csv(filename)
-                if len(df.columns) >= 3:
-                    return df.iloc[:, :3].values.tolist()
-        except:
-            pass
-        
-        # Manual parsing for text files with progress
-        try:
-            # Count total lines first for progress calculation
-            with open(filename, 'r') as f:
-                total_lines = sum(1 for _ in f)
-            
-            # Parse with progress updates
-            with open(filename, 'r') as f:
-                for line_num, line in enumerate(f):
-                    line = line.strip()
-                    
-                    # Skip empty lines and comments
-                    if not line or line.startswith('#') or line.startswith('//'):
-                        continue
-                    
-                    try:
-                        # Handle different separators
-                        line = line.replace(',', ' ').replace(';', ' ').replace('\t', ' ')
-                        coords = [float(x) for x in line.split() if x]
-                        
-                        if len(coords) >= 3:
-                            points.append(coords[:3])
-                            
-                    except ValueError:
-                        continue
-                    
-                    # Update progress every 5000 lines to avoid too frequent updates
-                    if line_num % 5000 == 0 and total_lines > 0:
-                        file_progress = int((line_num / total_lines) * progress_range)
-                        self.progress.emit(base_progress + file_progress)
-        
-        except Exception as e:
-            print(f"Error parsing {filename}: {e}")
-            
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                try:
+                    coords = [float(x) for x in line.replace(',', ' ').split()]
+                    if len(coords) >= 3:
+                        points.append(coords[:3])
+                except ValueError:
+                    continue
         return points
-    
+
 class CylinderAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -213,19 +140,26 @@ class CylinderAnalyzerGUI(QMainWindow):
         # Parameters section
         param_group = QWidget()
         param_layout = QVBoxLayout(param_group)
-        
-        # Z-window parameters
-        self.z_window = QDoubleSpinBox()
-        # self.z_window.setRange(0.001, 0.1)  # 1mm to 100mm in meters
-        self.z_window.setValue(9)  # 9 in meters
-        self.z_window.setSingleStep(0.5)  # 0.5mm in meters
-        self.z_window.setDecimals(4)  # Show 4 decimal places for meters
-        self.z_window.setEnabled(True)
-        param_layout.addWidget(QLabel("Window Length (m):"))
-        param_layout.addWidget(self.z_window)
-        
+
+        self.z_min_input = QDoubleSpinBox()
+        self.z_min_input.setRange(-10000, 10000)  # Wide range
+        self.z_min_input.setValue(0.0)  # Default, will be updated on data load
+        self.z_min_input.setSingleStep(1.0)
+        self.z_min_input.setDecimals(3)
+        self.z_min_input.setEnabled(False)  # Disable until data loads
+        param_layout.addWidget(QLabel("Z Min (m):"))
+        param_layout.addWidget(self.z_min_input)
+
+        self.z_max_input = QDoubleSpinBox()
+        self.z_max_input.setRange(-10000, 10000)
+        self.z_max_input.setValue(0.0)  # Default, will be updated on data load
+        self.z_max_input.setSingleStep(1.0)
+        self.z_max_input.setDecimals(3)
+        self.z_max_input.setEnabled(False)
+        param_layout.addWidget(QLabel("Z Max (m):"))
+        param_layout.addWidget(self.z_max_input)
+
         self.z_step = QDoubleSpinBox()
-        # self.z_step.setRange(0.0001, 0.05)  # 0.1mm to 50mm in meters
         self.z_step.setValue(2)  # 2 in meters
         self.z_step.setSingleStep(0.1)  # 0.1mm in meters
         self.z_step.setDecimals(4)  # Show 4 decimal places for meters
@@ -236,7 +170,6 @@ class CylinderAnalyzerGUI(QMainWindow):
         
         # Add slice thickness control
         self.slice_thickness = QDoubleSpinBox()
-        # self.slice_thickness.setRange(0.001, 0.05)  # 1mm to 50mm in meters
         self.slice_thickness.setValue(0.5)  # 5mm default
         self.slice_thickness.setSingleStep(0.1)
         self.slice_thickness.setDecimals(4)
@@ -259,11 +192,25 @@ class CylinderAnalyzerGUI(QMainWindow):
         param_layout.addWidget(QLabel("Angle Bins:"))
         param_layout.addWidget(self.angle_bins)
 
+        quality_group = QWidget()
+        quality_layout = QVBoxLayout(quality_group)  # Changed to vertical
+        
+        quality_layout.addWidget(QLabel("Display Quality:"))
+        
+        self.quality_dropdown = QComboBox()
+        self.quality_dropdown.addItems(["Ultra High", "High", "Medium", "Fast"])
+        self.quality_dropdown.setCurrentText("Medium")  # Default
+        self.quality_dropdown.currentTextChanged.connect(self.on_quality_changed)
+        quality_layout.addWidget(self.quality_dropdown)
+        
+        control_layout.addWidget(quality_group)
+        self.display_quality = 'medium'
+
         # Add checkbox for auto visualization
         self.auto_visualize = QCheckBox("Auto visualize slices after analysis")
         self.auto_visualize.setChecked(True)  # Default to enabled
         param_layout.addWidget(self.auto_visualize)
-        
+    
         # Analysis button
         analyze_btn = QPushButton("Analyze Slice")
         analyze_btn.clicked.connect(self.analyze_current)
@@ -276,9 +223,38 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.export_btn = export_btn  # Store reference to enable/disable
         param_layout.addWidget(export_btn)
         
+        # NEW: Add export data year button
+        export_year_btn = QPushButton("Export Data Year")
+        export_year_btn.clicked.connect(self.export_data_year)
+        export_year_btn.setEnabled(False)  # Disable until we have results
+        self.export_year_btn = export_year_btn  # Store reference to enable/disable
+        param_layout.addWidget(export_year_btn)
+        
         control_layout.addWidget(param_group)
         control_layout.addStretch()
-        
+
+        # Add memory monitor and controls
+        memory_group = QWidget()
+        memory_layout = QVBoxLayout(memory_group)
+
+        # Memory display
+        self.memory_label = QLabel("Memory: 0 MB")
+        memory_layout.addWidget(self.memory_label)
+
+        # Add clear data button
+        clear_btn = QPushButton("Clear All Data")
+        clear_btn.clicked.connect(self.clear_all_data)
+        clear_btn.setStyleSheet("QPushButton { color: red; }")
+        memory_layout.addWidget(clear_btn)
+
+        control_layout.addWidget(memory_group)
+
+        # Memory monitoring timer
+        from PyQt6.QtCore import QTimer
+        self.memory_timer = QTimer()
+        self.memory_timer.timeout.connect(self.update_memory_display)
+        self.memory_timer.start(3000)  # Update every 3 seconds
+
         # Add Z slice visualization controls with range limits
         slice_viz_group = QWidget()
         slice_viz_layout = QVBoxLayout(slice_viz_group)
@@ -308,6 +284,13 @@ class CylinderAnalyzerGUI(QMainWindow):
         show_slice_btn.setEnabled(False)  # Disable until data loads
         self.show_slice_btn = show_slice_btn
         slice_viz_layout.addWidget(show_slice_btn)
+
+        # NEW: Add export slice button
+        export_slice_btn = QPushButton("Export Slice")
+        export_slice_btn.clicked.connect(self.export_slice)
+        export_slice_btn.setEnabled(False)  # Disable until slice is visualized
+        self.export_slice_btn = export_slice_btn
+        slice_viz_layout.addWidget(export_slice_btn)
         
         # Add to control panel after parameters
         control_layout.addWidget(slice_viz_group)
@@ -317,11 +300,9 @@ class CylinderAnalyzerGUI(QMainWindow):
         compare_btn.clicked.connect(self.compare_years)
         control_layout.addWidget(compare_btn)
         
-        # VTK Widget for 3D visualization
-        self.vtk_widget = QVTKRenderWindowInteractor()
-        self.renderer = vtk.vtkRenderer()
-        self.vtk_widget.GetRenderWindow().AddRenderer(self.renderer)
-        self.renderer.SetBackground(0.1, 0.1, 0.1)
+        # Add processing time label
+        self.processing_time_label = QLabel("Processing Time: --")
+        control_layout.addWidget(self.processing_time_label)
         
         # Add tabs for results
         self.results_tabs = QTabWidget()
@@ -368,7 +349,7 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.vtk_widget_slices = QVTKRenderWindowInteractor()
         self.renderer_slices = vtk.vtkRenderer()
         self.vtk_widget_slices.GetRenderWindow().AddRenderer(self.renderer_slices)
-        self.renderer_slices.SetBackground(0.1, 0.1, 0.2)
+        self.renderer_slices.SetBackground(0.1, 0.2, 0.2)
         
         # Add labels for each view
         original_frame = QWidget()
@@ -416,12 +397,134 @@ class CylinderAnalyzerGUI(QMainWindow):
         # Add stats display
         self.stats_label = QLabel()
         control_layout.addWidget(self.stats_label)
+
+        # Initialize timing variables
+        self.load_time = 0.0
+        self.analyze_time = 0.0
+
+    def on_quality_changed(self, quality_text):
+        """Handle quality dropdown change"""
+        quality_map = {
+            "Ultra High": "ultra_high",
+            "High": "high", 
+            "Medium": "medium",
+            "Fast": "fast"
+        }
         
+        self.display_quality = quality_map[quality_text]
+        
+        if hasattr(self, 'points') and self.points is not None:
+            self.display_point_cloud()
+            
+            # Show quality info
+            total_points = len(self.points)
+            display_points = len(self.get_display_points())
+            ratio = (display_points / total_points) * 100
+            
+            self.statusBar().showMessage(
+                f"Display quality: {quality_text} - Showing {display_points:,}/{total_points:,} points ({ratio:.1f}%)"
+            )
+
+
+    def update_memory_display(self):
+        """Update memory usage display"""
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_mb = process.memory_info().rss / (1024 * 1024)
+            
+            if hasattr(self, 'points') and self.points is not None:
+                points_mb = self.points.nbytes / (1024*1024)
+                self.memory_label.setText(f"RAM: {memory_mb:.0f}MB (Points: {points_mb:.0f}MB)")
+                
+                # Color coding
+                if memory_mb > 6000:  # 6GB - red
+                    self.memory_label.setStyleSheet("color: red; font-weight: bold;")
+                elif memory_mb > 4000:  # 4GB - orange
+                    self.memory_label.setStyleSheet("color: orange; font-weight: bold;")
+                elif memory_mb > 2000:  # 2GB - yellow
+                    self.memory_label.setStyleSheet("color: #FF8C00; font-weight: bold;")
+                else:  # < 2GB - green
+                    self.memory_label.setStyleSheet("color: green;")
+            else:
+                self.memory_label.setText(f"RAM: {memory_mb:.0f}MB (No data)")
+                self.memory_label.setStyleSheet("color: gray;")
+                
+        except ImportError:
+            self.memory_label.setText("RAM: psutil not available")
+        except Exception:
+            pass
+
+    def clear_all_data(self):
+        """Clear all loaded data to free memory"""
+        from PyQt6.QtWidgets import QMessageBox
+        
+        if not hasattr(self, 'points') or self.points is None:
+            self.statusBar().showMessage("No data to clear")
+            return
+        
+        reply = QMessageBox.question(
+            self,
+            "Clear All Data",
+            f"Are you sure you want to clear {len(self.points):,} points?\n"
+            f"This will free up memory but you'll lose all current data.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            # Clear all data
+            if hasattr(self, 'points'):
+                del self.points
+                self.points = None
+            
+            if hasattr(self, 'current_results'):
+                del self.current_results
+            
+            # Clear VTK actors
+            if hasattr(self, 'point_cloud_actor') and self.point_cloud_actor:
+                self.renderer_original.RemoveActor(self.point_cloud_actor)
+                self.point_cloud_actor = None
+            
+            if hasattr(self, 'slice_actors'):
+                for actor in self.slice_actors:
+                    self.renderer_slices.RemoveActor(actor)
+                self.slice_actors = []
+            
+            # Clear plots
+            self.figure.clear()
+            self.canvas.draw()
+            self.slice_figure.clear()
+            self.slice_canvas.draw()
+            
+            # Update VTK
+            self.vtk_widget_original.GetRenderWindow().Render()
+            self.vtk_widget_slices.GetRenderWindow().Render()
+            
+            # Disable controls
+            self.z_slice_input.setEnabled(False)
+            self.show_slice_btn.setEnabled(False)
+            self.viz_slice_thickness.setEnabled(False)
+            self.export_btn.setEnabled(False)
+            self.export_year_btn.setEnabled(False)  # NEW: Disable export year button
+            self.export_slice_btn.setEnabled(False)  # NEW: Disable export slice button
+            
+            # Reset processing time
+            self.processing_time_label.setText("Processing Time: --")
+            self.load_time = 0.0
+            self.analyze_time = 0.0
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            self.statusBar().showMessage("All data cleared - memory freed")
+
     def load_file(self):
-        # Let user select multiple files directly - they can choose single or multiple
+        # Allow multi-file selection but load incrementally
         filenames, _ = QFileDialog.getOpenFileNames(
             self,
-            "Select Point Cloud File(s) - Choose multiple files to combine them",
+            "Select Point Cloud File(s) - Multiple files will be loaded incrementally",
             "",
             "Point Cloud Files (*.txt *.csv *.xyz);;All Files (*.*)"
         )
@@ -433,33 +536,213 @@ class CylinderAnalyzerGUI(QMainWindow):
             else:
                 self.statusBar().showMessage(f"Loading and combining {len(filenames)} files...")
             
-            self.start_loading(filenames)
+            # Start loading timer
+            self.load_timer = QElapsedTimer()
+            self.load_timer.start()
+            
+            self.start_incremental_loading(filenames)
 
-    def start_loading(self, filenames):
-        """Start loading process for single or multiple files"""
+    def start_incremental_loading(self, filenames):
+        """Load multiple files incrementally to avoid memory overflow"""
+        self.files_to_load = filenames.copy()
+        self.total_files = len(filenames)
+        self.current_file_index = 0
+        self.files_loaded = 0
+        
         # Show progress bar and disable UI
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.setEnabled(False)
         
-        # Create and start worker thread for multiple files
-        self.load_worker = LoadMultiplePointCloudWorker(filenames)
-        self.load_worker.progress.connect(self.update_progress)
-        self.load_worker.finished.connect(self.load_finished)
-        self.load_worker.error.connect(self.load_error)
-        self.load_worker.start()
+        # Start loading first file
+        self.load_next_file()
 
-    def load_finished(self, result):
-        points, num_points = result
-        self.points = points
+    def load_next_file(self):
+        """Load the next file in the queue"""
+        if self.current_file_index >= len(self.files_to_load):
+            # All files loaded, finish up
+            self.finish_incremental_loading()
+            return
+        
+        current_file = self.files_to_load[self.current_file_index]
+        
+        # Calculate overall progress
+        overall_progress = int((self.current_file_index / self.total_files) * 90)
+        self.progress_bar.setValue(overall_progress)
+        
+        # Show status
+        remaining = self.total_files - self.current_file_index
+        self.statusBar().showMessage(
+            f"Loading file {self.current_file_index + 1}/{self.total_files}: "
+            f"{os.path.basename(current_file)} ({remaining} remaining)"
+        )
+        
+        # Create worker for current file
+        self.current_load_worker = LoadPointCloudWorker(current_file)
+        self.current_load_worker.progress.connect(self.update_file_progress)
+        self.current_load_worker.finished.connect(self.single_file_loaded)
+        self.current_load_worker.error.connect(self.incremental_load_error)
+        self.current_load_worker.start()
+
+    def update_file_progress(self, file_progress):
+        """Update progress for current file loading"""
+        # Combine overall progress with current file progress
+        overall_progress = int((self.current_file_index / self.total_files) * 90)
+        file_contribution = int((file_progress / 100) * (90 / self.total_files))
+        total_progress = overall_progress + file_contribution
+        self.progress_bar.setValue(min(total_progress, 95))
+
+    def single_file_loaded(self, result):
+        """Handle completion of single file loading"""
+        new_points, num_new_points = result
+        
+        try:
+            # Get file info for reporting
+            current_file = self.files_to_load[self.current_file_index]
+            file_memory_mb = new_points.nbytes / (1024*1024)
+            
+            # Combine with existing data if we have any
+            if hasattr(self, 'points') and self.points is not None:
+                # Memory check before combining
+                existing_memory_mb = self.points.nbytes / (1024*1024)
+                total_memory_mb = existing_memory_mb + file_memory_mb
+                
+                # Warning if getting close to memory limit
+                if total_memory_mb > 6000:  # 6GB warning
+                    from PyQt6.QtWidgets import QMessageBox
+                    
+                    remaining_files = self.total_files - self.current_file_index - 1
+                    estimated_total_mb = total_memory_mb * (1 + remaining_files * 0.5)  # Rough estimate
+                    
+                    reply = QMessageBox.warning(
+                        self,
+                        "High Memory Usage Warning",
+                        f"Current memory usage: {total_memory_mb:.0f}MB\n"
+                        f"Estimated final usage: {estimated_total_mb:.0f}MB\n"
+                        f"Remaining files: {remaining_files}\n\n"
+                        f"Continue loading? (You can stop now to avoid memory issues)",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes
+                    )
+                    
+                    if reply == QMessageBox.StandardButton.No:
+                        # Stop loading, finish with current data
+                        self.finish_incremental_loading()
+                        return
+                
+                # Combine data
+                old_count = len(self.points)
+                combined_points = np.vstack([self.points, new_points])
+                
+                # Clear old data to free memory
+                del self.points
+                del new_points
+                import gc
+                gc.collect()
+                
+                self.points = combined_points
+                
+                self.statusBar().showMessage(
+                    f"Added {num_new_points:,} points from {os.path.basename(current_file)}. "
+                    f"Total: {len(self.points):,} points"
+                )
+                
+            else:
+                # First file
+                self.points = new_points
+                self.statusBar().showMessage(f"Loaded {num_new_points:,} points from {os.path.basename(current_file)}")
+            
+            self.files_loaded += 1
+            
+        except MemoryError:
+            self.statusBar().showMessage(f"Memory error loading {os.path.basename(current_file)} - stopping here")
+            self.finish_incremental_loading()
+            return
+        except Exception as e:
+            self.statusBar().showMessage(f"Error combining {os.path.basename(current_file)}: {str(e)}")
+        
+        # Move to next file
+        self.current_file_index += 1
+        
+        # Small delay to allow UI updates and memory cleanup
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(100, self.load_next_file)
+
+    def incremental_load_error(self, error_msg):
+        """Handle error during incremental loading"""
+        current_file = self.files_to_load[self.current_file_index]
+        self.statusBar().showMessage(f"Error loading {os.path.basename(current_file)}: {error_msg}")
+        
+        # Skip this file and continue with next
+        self.current_file_index += 1
+        
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(100, self.load_next_file)
+
+    def finish_incremental_loading(self):
+        """Finish incremental loading process"""
+        # Clean up loading state
+        if hasattr(self, 'current_load_worker'):
+            del self.current_load_worker
+        
+        # Stop load timer and record time
+        load_elapsed = self.load_timer.elapsed() / 1000.0
+        self.load_time = load_elapsed
+        
+        # Update processing time label
+        self.update_processing_time_label()
+        
+        # Update UI if we have data
+        if hasattr(self, 'points') and self.points is not None:
+            self.update_ui_after_load()
+            
+            # Show final stats
+            final_memory_mb = self.points.nbytes / (1024*1024)
+            self.statusBar().showMessage(
+                f"Incremental loading complete! Loaded {self.files_loaded}/{self.total_files} files. "
+                f"Total: {len(self.points):,} points ({final_memory_mb:.0f}MB) - Load time: {load_elapsed:.2f}s"
+            )
+        else:
+            self.statusBar().showMessage("No data loaded")
+            self.setEnabled(True)
+            self.progress_bar.setVisible(False)
+        
+        # Clean up
+        if hasattr(self, 'files_to_load'):
+            del self.files_to_load
+
+    def update_ui_after_load(self):
+        """Update UI elements after loading data"""
+        # Clear old analysis results
+        if hasattr(self, 'current_results'):
+            del self.current_results
+            self.export_btn.setEnabled(False)
+            self.export_year_btn.setEnabled(False)  # NEW: Disable export year button
+        
+        # Clear VTK actors
+        if hasattr(self, 'point_cloud_actor') and self.point_cloud_actor:
+            self.renderer_original.RemoveActor(self.point_cloud_actor)
+            self.point_cloud_actor = None
+        
+        if hasattr(self, 'slice_actors'):
+            for actor in self.slice_actors:
+                self.renderer_slices.RemoveActor(actor)
+            self.slice_actors = []
         
         # Update Z range based on loaded data
         z_min = np.min(self.points[:, 2])
         z_max = np.max(self.points[:, 2])
+        self.z_min_input.setRange(z_min, z_max)
+        self.z_min_input.setValue(z_min)
+        self.z_max_input.setValue(z_max)
+        self.z_max_input.setRange(z_min, z_max)
+        self.z_min_input.setEnabled(True)
+        self.z_max_input.setEnabled(True)
+        z_range = z_max - z_min
         
         # Set Z spinbox range and initial value
         self.z_slice_input.setRange(z_min, z_max)
-        self.z_slice_input.setValue(z_min + (z_range := z_max - z_min)/2)
+        self.z_slice_input.setValue(z_min + z_range/2)
         self.z_slice_input.setSingleStep(z_range/50)
 
         # Set reasonable default thickness based on data range
@@ -471,56 +754,133 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.show_slice_btn.setEnabled(True)
         self.viz_slice_thickness.setEnabled(True)
         
+        # Update displays
         self.display_point_cloud()
         self.show_statistics()
+        
+        # Clear plots
+        self.figure.clear()
+        self.canvas.draw()
+        self.slice_figure.clear()
+        self.slice_canvas.draw()
+        
         self.progress_bar.setVisible(False)
         self.setEnabled(True)
-        
-        # Show appropriate message based on number of files loaded
-        if hasattr(self.load_worker, 'filenames'):
-            file_count = len(self.load_worker.filenames)
-            if file_count == 1:
-                self.statusBar().showMessage(f"Loaded {num_points:,} points")
-            else:
-                self.statusBar().showMessage(f"Combined {num_points:,} points from {file_count} files")
-        else:
-            self.statusBar().showMessage(f"Loaded {num_points:,} points")
 
     def load_error(self, error_msg):
         self.progress_bar.setVisible(False)
         self.setEnabled(True)
         self.statusBar().showMessage(f"Error loading file: {error_msg}")
-    
+
+    def set_display_quality(self, quality):
+        """Set display quality and refresh if we have data"""
+        self.display_quality = quality
+        if hasattr(self, 'points') and self.points is not None:
+            self.display_point_cloud()
+
     def display_point_cloud(self):
         if self.point_cloud_actor:
             self.renderer_original.RemoveActor(self.point_cloud_actor)
             
+        # Get points based on current quality setting
+        display_points = self.get_display_points()
+        
+        # Get point size from quality setting
+        quality_settings = {
+            'ultra_high': {'max_points': 2000000, 'point_size': 3},
+            'high': {'max_points': 1000000, 'point_size': 3},
+            'medium': {'max_points': 200000, 'point_size': 2},
+            'fast': {'max_points': 50000, 'point_size': 1}
+        }
+        point_size = quality_settings[self.display_quality]['point_size']
+        
+        # Show loading message for large datasets
+        if len(display_points) > 500000:
+            self.statusBar().showMessage(f"Rendering {len(display_points):,} points (this may take a moment)...")
+        
         # Create VTK points
         vtk_points = vtk.vtkPoints()
-        for point in self.points:
+        for point in display_points:
             vtk_points.InsertNextPoint(point[0], point[1], point[2])
             
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(vtk_points)
         
-        # Vertex filter
         vertex_filter = vtk.vtkVertexGlyphFilter()
         vertex_filter.SetInputData(polydata)
         vertex_filter.Update()
         
-        # Create mapper and actor
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(vertex_filter.GetOutputPort())
         
         self.point_cloud_actor = vtk.vtkActor()
         self.point_cloud_actor.SetMapper(mapper)
         self.point_cloud_actor.GetProperty().SetColor(0.5, 0.5, 1.0)
-        self.point_cloud_actor.GetProperty().SetPointSize(3)
+        self.point_cloud_actor.GetProperty().SetPointSize(point_size)
         
         self.renderer_original.AddActor(self.point_cloud_actor)
         self.renderer_original.ResetCamera()
         self.vtk_widget_original.GetRenderWindow().Render()
+        
+        # Show completion message with details
+        total_points = len(self.points)
+        display_ratio = (len(display_points) / total_points) * 100
+        quality_name = self.quality_dropdown.currentText()
+        
+        self.statusBar().showMessage(
+            f"{quality_name} quality: {len(display_points):,}/{total_points:,} points ({display_ratio:.1f}%) rendered"
+        )
     
+    def get_display_points(self):
+        """Get subsampled points based on current quality setting"""
+        if self.points is None:
+            return np.array([])
+        
+        # Updated quality settings with Ultra High option
+        quality_settings = {
+            'ultra_high': {'max_points': 2000000, 'point_size': 3},  # 2M points - much higher
+            'high': {'max_points': 1000000, 'point_size': 3},        # 1M points
+            'medium': {'max_points': 200000, 'point_size': 2},       # 200K points  
+            'fast': {'max_points': 50000, 'point_size': 1}          # 50K points
+        }
+        
+        settings = quality_settings.get(self.display_quality, quality_settings['medium'])
+        max_points = settings['max_points']
+        total_points = len(self.points)
+        
+        if total_points <= max_points:
+            # If data is smaller than limit, show all points
+            return self.points
+        
+        # Smart subsampling based on ratio
+        sample_ratio = max_points / total_points
+        
+        if sample_ratio > 0.8:  # > 80% - use random sampling
+            indices = np.random.choice(total_points, max_points, replace=False)
+            return self.points[indices]
+        elif sample_ratio > 0.5:  # 50-80% - mixed sampling for better coverage
+            # Use systematic + random sampling
+            systematic_count = int(max_points * 0.7)
+            random_count = max_points - systematic_count
+            
+            # Systematic sampling
+            step = total_points // systematic_count
+            systematic_indices = np.arange(0, total_points, step)[:systematic_count]
+            
+            # Random sampling from remaining points
+            remaining_indices = np.setdiff1d(np.arange(total_points), systematic_indices)
+            if len(remaining_indices) >= random_count:
+                random_indices = np.random.choice(remaining_indices, random_count, replace=False)
+                all_indices = np.concatenate([systematic_indices, random_indices])
+            else:
+                all_indices = systematic_indices
+                
+            return self.points[all_indices]
+        else:  # < 50% - systematic sampling only
+            step = int(1 / sample_ratio)
+            indices = np.arange(0, total_points, step)[:max_points]
+            return self.points[indices]
+        
     def analyze_current(self):
         if self.points is None:
             self.statusBar().showMessage("Please load point cloud first")
@@ -528,7 +888,6 @@ class CylinderAnalyzerGUI(QMainWindow):
             
         # Get parameters from GUI
         params = {
-            'window_len': self.z_window.value(),
             'z_step': self.z_step.value(),
             'boundary_method': self.boundary_method.currentText(),
             'angle_bins': self.angle_bins.value(),
@@ -537,13 +896,19 @@ class CylinderAnalyzerGUI(QMainWindow):
             'overlay_all': True,
             'max_points_for_speed': 1_000_000,
             'min_points_per_slice': 1000,
-            'inlier_quantile': 0.80
+            'inlier_quantile': 0.80,
+            'z_min': self.z_min_input.value(),
+            'z_max': self.z_max_input.value()
         }
         
         # Disable UI during analysis
         self.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
+        
+        # Start processing timer
+        self.processing_timer = QElapsedTimer()
+        self.processing_timer.start()
         
         # Create and start worker thread
         self.worker = AnalysisWorker(self.points, params)
@@ -556,6 +921,7 @@ class CylinderAnalyzerGUI(QMainWindow):
     def analysis_error(self, error_msg):
         self.setEnabled(True)
         self.progress_bar.setVisible(False)
+        self.processing_time_label.setText("Processing Time: --")
         self.statusBar().showMessage(f"Error during analysis: {error_msg}")
     
     def update_progress(self, value):
@@ -566,9 +932,18 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.setEnabled(True)
         self.progress_bar.setVisible(False)
         
+        # Stop timer and calculate elapsed time
+        elapsed_ms = self.processing_timer.elapsed()
+        elapsed_sec = elapsed_ms / 1000.0
+        self.analyze_time = elapsed_sec
+        
+        # Update processing time label
+        self.update_processing_time_label()
+        
         if results["status"] == "success":
             self.current_results = results["results"]
             self.export_btn.setEnabled(True)
+            self.export_year_btn.setEnabled(True)  # NEW: Enable export year button
             self.display_results(self.current_results)
             
             # Auto-visualize all slices in Plots tab
@@ -580,18 +955,46 @@ class CylinderAnalyzerGUI(QMainWindow):
                 self.statusBar().showMessage(f"Analysis completed - {len(self.current_results)} slices visualized in both 2D and 3D")
             else:
                 self.statusBar().showMessage(f"Analysis completed - {len(self.current_results)} slices visualized in 2D plots")
+            
+            # Update status with analyze time
+            self.statusBar().showMessage(f"Analysis completed - {len(self.current_results)} slices in {elapsed_sec:.2f}s")
         else:
+            self.processing_time_label.setText("Processing Time: --")
             self.statusBar().showMessage("Analysis failed")
 
+    def update_processing_time_label(self):
+        """Update the processing time label with load and analyze times"""
+        load_str = f"Load: {self.load_time:.2f}s" if self.load_time > 0 else "Load: --"
+        analyze_str = f"Analyze: {self.analyze_time:.2f}s" if self.analyze_time > 0 else "Analyze: --"
+        self.processing_time_label.setText(f"Processing Time: {load_str}, {analyze_str}")
+
+    # NEW: Add method to compute residual profile
+    def compute_residual_profile(self, result):
+        """Compute theta and delta_r for a slice result, using boundary points."""
+        if "boundary_points" not in result or not result["boundary_points"]:
+            return None
+        boundary_xy = np.array(result["boundary_points"])
+        cx, cy, R = result["cx"], result["cy"], result["R"]
+        
+        dx = boundary_xy[:, 0] - cx
+        dy = boundary_xy[:, 1] - cy
+        theta = (np.arctan2(dy, dx) + 2 * np.pi) % (2 * np.pi)
+        r = np.hypot(dx, dy)
+        delta_r = r - R
+        
+        # Sort by theta for smooth plotting
+        order = np.argsort(theta)
+        return theta[order], delta_r[order]
+
     def visualize_all_slices_in_plots(self):
-        """Visualize all analyzed slices in the Plots tab"""
+        """Visualize residual profiles (Δr vs θ) for all analyzed slices in the Plots tab"""
         if not hasattr(self, 'current_results') or not self.current_results:
             return
         
         # Clear previous plots
         self.figure.clear()
         
-        # Get thickness for visualization - Use analysis slice thickness, not viz thickness
+        # Get slice thickness for title
         slice_thickness = self.slice_thickness.value()
         
         # Determine grid layout based on number of slices - REMOVED 16 plot limit
@@ -627,7 +1030,26 @@ class CylinderAnalyzerGUI(QMainWindow):
         if num_slices > 16:
             self.figure.set_size_inches(12, 10)  # Larger figure for more plots
         
-        self.statusBar().showMessage(f"Visualizing {max_plots} slices...")
+        self.statusBar().showMessage(f"Visualizing {max_plots} residual profiles...")
+        
+        # Ask user for PDF save location
+        pdf_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Residual Profiles to PDF",
+            f"residual_profiles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+            "PDF Files (*.pdf);;All Files (*.*)"
+        )
+        
+        # Import PdfPages for multi-page PDF
+        from matplotlib.backends.backend_pdf import PdfPages
+        
+        pdf_pages = None
+        if pdf_path:
+            try:
+                pdf_pages = PdfPages(pdf_path)
+            except Exception as e:
+                self.statusBar().showMessage(f"Error creating PDF: {str(e)}")
+                pdf_path = None
         
         # Create subplots for each slice
         for i, result in enumerate(self.current_results[:max_plots]):
@@ -636,105 +1058,71 @@ class CylinderAnalyzerGUI(QMainWindow):
             try:
                 # Get slice data
                 z_target = result['z_center']
-                cx = result['cx']
-                cy = result['cy']
-                radius = result['R']
-                ovality_pct = result.get('ovality_pct', 0.0)
                 
-                dz = slice_thickness / 2.0
-                
-                # Get slice points
-                mask = (self.points[:, 2] >= z_target - dz) & (self.points[:, 2] <= z_target + dz)
-                slice_points = self.points[mask]
-                
-                if len(slice_points) < 50:  # Skip if too few points
-                    ax.text(0.5, 0.5, f'Too few points\n({len(slice_points)})', 
+                # Compute residual profile
+                profile = self.compute_residual_profile(result)
+                if profile is None:
+                    ax.text(0.5, 0.5, 'No boundary data', 
                         ha='center', va='center', transform=ax.transAxes)
-                    ax.set_title(f'Z={z_target:.2f}m')
+                    ax.set_title(f'Z={z_target:.2f}m, Thickness={slice_thickness:.3f}m')
                     continue
                 
-                # Subsample points for faster plotting - reduce for many plots
-                max_points = 3000 if num_slices > 20 else 5000
-                if len(slice_points) > max_points:
-                    idx = np.random.choice(len(slice_points), max_points, replace=False)
-                    plot_points = slice_points[idx]
-                else:
-                    plot_points = slice_points
+                theta, delta_r = profile
                 
-                # Plot points - smaller points for many plots
-                point_size = 0.3 if num_slices > 20 else 0.5
-                ax.scatter(plot_points[:, 0], plot_points[:, 1], 
-                        s=point_size, alpha=0.4, c='lightblue', rasterized=True)
+                # Convert theta from radians to degrees
+                theta_deg = np.degrees(theta)
                 
-                # Try to get and plot boundary if available
-                try:
-                    # Re-analyze this slice to get boundary - Use analysis parameters
-                    params = {
-                        'window_len': slice_thickness,
-                        'z_step': self.z_step.value(),
-                        'boundary_method': self.boundary_method.currentText(),
-                        'angle_bins': self.angle_bins.value(),
-                        'max_points_for_speed': 1_000_000,
-                        'min_points_per_slice': 50,
-                        'inlier_quantile': 0.80
-                    }
+                # Plot baseline (ideal circle) and residuals
+                ax.axhline(0.0, color='k', linestyle='--', linewidth=1.5, label='Ideal circle (Δr=0)')
+                ax.plot(theta_deg, delta_r, 'b-', linewidth=1, label='Δr = r - R')
+                
+                # Formatting
+                ax.set_xlabel('θ (deg)', fontsize=6 if num_slices > 25 else 8)
+                ax.set_ylabel('Δr', fontsize=6 if num_slices > 25 else 8)
+                ax.set_title(f'Z={z_target:.2f}m, Thickness={slice_thickness:.3f}m', fontsize=6 if num_slices > 25 else 8)
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=6 if num_slices > 25 else 8)
+                
+                # Set ticks every 30 degrees
+                ax.set_xticks(np.arange(0, 360, 30))
+                
+                # Adjust ticks for readability
+                ax.tick_params(labelsize=5 if num_slices > 25 else 7)
+                
+                # Save individual plot to PDF if requested
+                if pdf_pages:
+                    # Create a separate figure for PDF page
+                    fig_pdf = plt.figure(figsize=(8, 6))
+                    ax_pdf = fig_pdf.add_subplot(1, 1, 1)
                     
-                    analyzer = CylinderAnalyzer(Config(**params))
-                    slice_result = analyzer.process_slice(slice_points, z_target)
+                    # Replicate the plot for PDF
+                    ax_pdf.axhline(0.0, color='k', linestyle='--', linewidth=1.5, label='Ideal circle (Δr=0)')
+                    ax_pdf.plot(theta_deg, delta_r, 'b-', linewidth=1, label='Δr = r - R')
+                    ax_pdf.set_xlabel('θ (deg)', fontsize=8)
+                    ax_pdf.set_ylabel('Δr', fontsize=8)
+                    ax_pdf.set_title(f'Z={z_target:.2f}m, Thickness={slice_thickness:.3f}m', fontsize=8)
+                    ax_pdf.grid(True, alpha=0.3)
+                    ax_pdf.legend(fontsize=8)
+                    ax_pdf.set_xticks(np.arange(0, 360, 30))
                     
-                    if slice_result and len(slice_result) >= 3:
-                        inner_tuple = slice_result[0]
-                        if isinstance(inner_tuple, tuple) and len(inner_tuple) >= 2:
-                            edge_xy = inner_tuple[1]
-                            if edge_xy is not None and len(edge_xy) > 0:
-                                line_width = 0.8 if num_slices > 20 else 1.0
-                                ax.plot(edge_xy[:, 0], edge_xy[:, 1], 'k-', 
-                                    linewidth=line_width, alpha=0.8)
-                except:
-                    pass  # Skip boundary if failed
-                
-                # Plot fitted circle
-                theta = np.linspace(0, 2*np.pi, 360)
-                circle_x = cx + radius * np.cos(theta)
-                circle_y = cy + radius * np.sin(theta)
-                circle_width = 1.0 if num_slices > 20 else 1.5
-                ax.plot(circle_x, circle_y, 'r-', linewidth=circle_width, alpha=0.9)
-                
-                # Plot center
-                marker_size = 6 if num_slices > 20 else 8
-                ax.plot(cx, cy, 'r+', markersize=marker_size, markeredgewidth=2)
-                
-                # Set equal aspect and limits
-                ax.set_aspect('equal')
-                
-                # Set title with key information - smaller font for many plots
-                title_fontsize = 6 if num_slices > 25 else 8
-                ax.set_title(f'Z={z_target:.2f}m\nR={radius:.3f}m, O={ovality_pct:.1f}%', 
-                            fontsize=title_fontsize)
-                
-                # Minimal axis labels for space - only for bottom and left edges
-                label_fontsize = 6 if num_slices > 25 else 8
-                if i >= num_slices - cols:  # Bottom row
-                    ax.set_xlabel('X (m)', fontsize=label_fontsize)
-                if i % cols == 0:  # Left column
-                    ax.set_ylabel('Y (m)', fontsize=label_fontsize)
-                    
-                # Smaller tick labels
-                tick_fontsize = 5 if num_slices > 25 else 7
-                ax.tick_params(labelsize=tick_fontsize)
-                
-                # Add grid
-                ax.grid(True, alpha=0.2 if num_slices > 20 else 0.3)
+                    fig_pdf.tight_layout()
+                    pdf_pages.savefig(fig_pdf)
+                    plt.close(fig_pdf)
                 
             except Exception as e:
                 # If individual slice fails, show error
                 ax.text(0.5, 0.5, f'Error:\n{str(e)[:20]}...', 
                     ha='center', va='center', transform=ax.transAxes, fontsize=6)
-                ax.set_title(f'Z={result["z_center"]:.2f}m - Error', fontsize=6)
+                ax.set_title(f'Z={result["z_center"]:.2f}m, Thickness={slice_thickness:.3f}m - Error', fontsize=6)
+        
+        # Close PDF if created
+        if pdf_pages:
+            pdf_pages.close()
+            self.statusBar().showMessage(f"PDF saved to {pdf_path}")
         
         # Adjust layout - Show analysis thickness in title
         title_fontsize = 10 if num_slices > 25 else 12
-        self.figure.suptitle(f'All Analyzed Slices (Analysis Thickness: {slice_thickness:.3f}m)', 
+        self.figure.suptitle(f'Residual Profiles (Δr vs θ) - Analysis Thickness: {slice_thickness:.3f}m', 
                             fontsize=title_fontsize)
         
         # Tighter layout for many plots
@@ -748,6 +1136,10 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.results_tabs.setCurrentIndex(1)  # Switch to Plots tab
         
         self.statusBar().showMessage(f"All {max_plots} slices visualized in Plots tab (Thickness: {slice_thickness:.3f}m)")
+        #open file explorer to show pdf
+        if pdf_path:
+            os.startfile(os.path.dirname(pdf_path))
+
     def display_results(self, results):
         # Update table with all columns
         headers = [
@@ -903,50 +1295,6 @@ class CylinderAnalyzerGUI(QMainWindow):
             f"{main_axis} range: {max(ranges):.3f}m"
         )
 
-    # Add this method to the CylinderAnalyzerGUI class
-
-    def load_comparison_files(self):
-        filenames, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Select Point Cloud Files for Comparison",
-            "",
-            "Point Cloud Files (*.txt *.csv *.xyz);;All Files (*.*)"
-        )
-        
-        if not filenames:
-            return []
-            
-        comparison_data = []
-        for filename in filenames:
-            try:
-                # Show progress
-                self.statusBar().showMessage(f"Loading {filename}...")
-                self.progress_bar.setVisible(True)
-                self.progress_bar.setValue(0)
-                
-                # Create and run worker for each file
-                worker = LoadPointCloudWorker(filename)
-                worker.progress.connect(self.update_progress)
-                worker.start()
-                worker.wait()  # Wait for completion
-                
-                # Get year from filename (assuming format YYYY_*.txt)
-                try:
-                    year = os.path.basename(filename).split('_')[0]
-                except:
-                    year = os.path.basename(filename)
-                
-                points = np.loadtxt(filename)
-                if points.shape[1] >= 3:  # Ensure we have x,y,z columns
-                    comparison_data.append((year, points))
-                
-            except Exception as e:
-                self.statusBar().showMessage(f"Error loading {filename}: {str(e)}")
-                continue
-                
-        self.progress_bar.setVisible(False)
-        return comparison_data
-
     # Add this method to CylinderAnalyzerGUI class
     def export_results(self):
         if not hasattr(self, 'current_results'):
@@ -1005,7 +1353,117 @@ class CylinderAnalyzerGUI(QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f"Error exporting results: {str(e)}")
     
-    # Add this method to CylinderAnalyzerGUI class
+    # NEW: Add method to export data for a specific year
+    def export_data_year(self):
+        """Export data for a specific year with detailed boundary information for comparison"""
+        if not hasattr(self, 'current_results'):
+            self.statusBar().showMessage("No results to export")
+            return
+        
+        # Get year from user input
+        year, ok = QInputDialog.getText(
+            self,
+            "Enter Year",
+            "Enter the year this data was scanned:",
+            text=str(datetime.now().year)
+        )
+        
+        if not ok or not year.strip():
+            return
+        
+        try:
+            year = year.strip()
+            
+            # Get directory to save files
+            save_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Select Directory to Save Year Data",
+                "",
+                QFileDialog.Option.ShowDirsOnly
+            )
+            
+            if not save_dir:
+                return
+            
+            # Prepare data for export
+            export_data = []
+            
+            for result in self.current_results:
+                z_center = result['z_center']
+                cx = result['cx']
+                cy = result['cy']
+                R = result['R']
+                thickness = self.slice_thickness.value()  # Get current slice thickness
+                
+                # Get boundary points and compute delta_r
+                if 'boundary_points' in result and result['boundary_points']:
+                    boundary_xy = np.array(result['boundary_points'])
+                    
+                    # Compute delta_r for each boundary point
+                    dx = boundary_xy[:, 0] - cx
+                    dy = boundary_xy[:, 1] - cy
+                    r = np.hypot(dx, dy)
+                    delta_r = r - R
+                    
+                    # Compute theta for ordering
+                    theta = (np.arctan2(dy, dx) + 2 * np.pi) % (2 * np.pi)
+                    
+                    # Create rows for each boundary point
+                    for i, (theta_val, delta_r_val) in enumerate(zip(theta, delta_r)):
+                        export_data.append({
+                            'year': year,
+                            'z_center': z_center,
+                            'cx': cx,
+                            'cy': cy,
+                            'R': R,
+                            'thickness': thickness,
+                            'theta': theta_val,
+                            'delta_r': delta_r_val,
+                            'boundary_point_index': i
+                        })
+                else:
+                    # If no boundary points, still export slice info with NaN delta_r
+                    export_data.append({
+                        'year': year,
+                        'z_center': z_center,
+                        'cx': cx,
+                        'cy': cy,
+                        'R': R,
+                        'thickness': thickness,
+                        'theta': np.nan,
+                        'delta_r': np.nan,
+                        'boundary_point_index': 0
+                    })
+            
+            # Create DataFrame and save
+            df_export = pd.DataFrame(export_data)
+            export_path = os.path.join(save_dir, f"year_{year}_boundary_data.csv")
+            df_export.to_csv(export_path, index=False, float_format='%.6f')
+            
+            # Also save summary statistics for the year
+            summary_data = []
+            for result in self.current_results:
+                summary_data.append({
+                    'year': year,
+                    'z_center': result['z_center'],
+                    'cx': result['cx'],
+                    'cy': result['cy'],
+                    'R': result['R'],
+                    'thickness': self.slice_thickness.value(),
+                    'ovality_pct': result.get('ovality_pct', np.nan),
+                    'n_boundary_points': len(result.get('boundary_points', []))
+                })
+            
+            df_summary = pd.DataFrame(summary_data)
+            summary_path = os.path.join(save_dir, f"year_{year}_summary.csv")
+            df_summary.to_csv(summary_path, index=False, float_format='%.6f')
+            
+            self.statusBar().showMessage(
+                f"Year {year} data exported to {save_dir} - {len(export_data)} boundary points"
+            )
+            
+        except Exception as e:
+            self.statusBar().showMessage(f"Error exporting year data: {str(e)}")
 
     def visualize_slice(self):
         if self.points is None:
@@ -1029,7 +1487,6 @@ class CylinderAnalyzerGUI(QMainWindow):
             
         # Configure parameters with visualization thickness
         params = {
-            'window_len': slice_thickness,  # Use visualization thickness
             'z_step': self.z_step.value(),
             'boundary_method': self.boundary_method.currentText(),
             'angle_bins': self.angle_bins.value(),
@@ -1111,17 +1568,26 @@ class CylinderAnalyzerGUI(QMainWindow):
                 print(f"Debug - Error parsing result: {parse_error}")
                 self.statusBar().showMessage(f"Error parsing analysis result: {str(parse_error)}")
                 return
-        
+
             # Validate extracted values
             if R <= 0:
-                self.statusBar().showMessage("Invalid radius calculated - try adjusting parameters")
+                self.statusBar().showMessage("Invalid radius calculated - try increasing parameters")
                 return
-        
+
             print(f"Debug - Final values: xc={xc}, yc={yc}, R={R}, ovality={ovality_pct}")
-        
+
+            # Extract inlier_mask if available
+            inlier_mask = None
+            if isinstance(result_dict, dict) and "inlier_mask" in result_dict:
+                inlier_mask = np.array(result_dict["inlier_mask"], dtype=bool)
+                print(f"Debug - Using inlier mask with {np.sum(inlier_mask)}/{len(inlier_mask)} inliers")
+
             # Clear previous plot
             self.slice_figure.clear()
-            ax = self.slice_figure.add_subplot(111)
+            
+            # Create 1x2 subplots
+            ax1 = self.slice_figure.add_subplot(1, 2, 1)  # Left: XY view
+            ax2 = self.slice_figure.add_subplot(1, 2, 2)  # Right: Residual profile
             
             # Plot points (subsample if too many)
             if len(slice_points) > 30000:
@@ -1130,54 +1596,89 @@ class CylinderAnalyzerGUI(QMainWindow):
             else:
                 plot_points = slice_points
             
-            # Plot points, boundary and fitted circle
-            ax.scatter(plot_points[:, 0], plot_points[:, 1], 
+            # Left subplot: XY view
+            ax1.scatter(plot_points[:, 0], plot_points[:, 1], 
                     s=1, alpha=0.3, label='Points', c='lightblue')
             
             if edge_xy is not None and len(edge_xy) > 0:
-                ax.plot(edge_xy[:, 0], edge_xy[:, 1], 'k-', 
+                ax1.plot(edge_xy[:, 0], edge_xy[:, 1], 'k-', 
                     linewidth=1.5, label='Boundary')
             
             # Plot fitted circle
             theta = np.linspace(0, 2*np.pi, 360)
             circle_x = xc + R*np.cos(theta)
             circle_y = yc + R*np.sin(theta)
-            ax.plot(circle_x, circle_y, 'r-', 
+            ax1.plot(circle_x, circle_y, 'r-', 
                 linewidth=2, label='Fitted Circle')
             
             # Plot center
-            ax.plot(xc, yc, 'r+', markersize=12, markeredgewidth=3, label='Center')
+            ax1.plot(xc, yc, 'r+', markersize=12, markeredgewidth=3, label='Center')
             
-            # Add text with parameters (in meters)
-            info_text = (
-                f"Z = {z_target:.4f} ± {dz:.4f} m\n"
-                f"Points: {len(slice_points):,}\n"
-                f"Edge Points: {len(edge_xy) if edge_xy is not None else 0}\n"
-                f"Center: ({xc:.4f}, {yc:.4f}) m\n"
-                f"Radius: {R:.4f} m\n"
-                f"Ovality: {ovality_pct:.3f}%\n"
-                f"Viz Thickness: {slice_thickness:.3f} m"
-            )
-            ax.text(0.02, 0.98, info_text,
-                transform=ax.transAxes,
-                verticalalignment='top',
-                fontsize=9,
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+            ax1.set_aspect('equal')
+            ax1.grid(True, alpha=0.3)
+            ax1.set_xlabel('X (m)')
+            ax1.set_ylabel('Y (m)')
+            ax1.set_title('XY View')
+            ax1.legend()
             
-            ax.set_aspect('equal')
-            ax.grid(True, alpha=0.3)
-            ax.set_xlabel('X (m)')
-            ax.set_ylabel('Y (m)')
-            ax.set_title(f'Slice Visualization at Z = {z_target:.4f}m (±{dz:.4f}m)')
+            # Right subplot: Residual profile (Δr vs θ)
+            if edge_xy is not None and len(edge_xy) > 0:
+                # Compute residual profile
+                dx = edge_xy[:, 0] - xc
+                dy = edge_xy[:, 1] - yc
+                theta_res = (np.arctan2(dy, dx) + 2 * np.pi) % (2 * np.pi)
+                r = np.hypot(dx, dy)
+                delta_r = r - R
+                
+                # MODIFIED: Filter outliers using inlier_mask or dynamic quantile filtering
+                if inlier_mask is not None and len(inlier_mask) == len(edge_xy):
+                    # Use inlier mask from hybrid fit (preferred)
+                    valid_mask = inlier_mask
+                    print(f"Debug - Filtered to {np.sum(valid_mask)} inlier points")
+                else:
+                    # Fallback: Dynamic outlier filtering using quantile (remove top 5% outliers)
+                    abs_delta_r = np.abs(delta_r)
+                    threshold = np.quantile(abs_delta_r, 0.95)  # 95th percentile as threshold
+                    valid_mask = abs_delta_r <= threshold
+                    print(f"Debug - Fallback filtering: removed {np.sum(~valid_mask)} outliers using quantile threshold {threshold:.3f}")
+                
+                # Apply filtering
+                theta_filtered = theta_res[valid_mask]
+                delta_r_filtered = delta_r[valid_mask]
+                
+                # Sort by theta for smooth plotting
+                order = np.argsort(theta_filtered)
+                theta_sorted = theta_filtered[order]
+                delta_r_sorted = delta_r_filtered[order]
+                
+                # Convert theta from radians to degrees
+                theta_sorted_deg = np.degrees(theta_sorted)
+                
+                # Plot baseline and residuals
+                ax2.axhline(0.0, color='k', linestyle='--', linewidth=1.5, label='Ideal circle (Δr=0)')
+                ax2.plot(theta_sorted_deg, delta_r_sorted, 'b-', linewidth=1, label='Δr = r - R')
+                
+                # Add red dots at each boundary point position
+                ax2.scatter(theta_sorted_deg, delta_r_sorted, color='red', s=8, alpha=0.8, label='Boundary points')
+                
+                # Add info about filtering
+                ax2.text(0.02, 0.98, f'Filtered: {len(theta_sorted)}/{len(edge_xy)} points', 
+                        transform=ax2.transAxes, fontsize=8, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                
+                ax2.set_xlabel('θ (deg)')
+                ax2.set_ylabel('Δr')
+                ax2.set_title('Residual Profile (Outliers Filtered)')
+                ax2.grid(True, alpha=0.3)
+                ax2.set_xticks(np.arange(0, 360, 30))
+                ax2.legend()
+            else:
+                ax2.text(0.5, 0.5, 'No boundary data', ha='center', va='center', transform=ax2.transAxes)
+                ax2.set_title('Residual Profile')
             
-            # Adjust layout before adding legend
+            # Overall title and layout
+            self.slice_figure.suptitle(f'Slice at Z = {z_target:.4f}m (±{dz:.4f}m) - Thickness: {slice_thickness:.3f}m')
             self.slice_figure.tight_layout()
-            
-            # Add legend with better placement
-            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-            
-            # Adjust subplot parameters to fit legend
-            self.slice_figure.subplots_adjust(right=0.85)
             
             self.slice_canvas.draw()
             
@@ -1185,6 +1686,23 @@ class CylinderAnalyzerGUI(QMainWindow):
             self.results_tabs.setCurrentIndex(2)
             
             self.statusBar().showMessage(f"Slice visualization complete - {len(slice_points):,} points, thickness: {slice_thickness:.3f}m")
+            
+            # After successful processing, store the slice result
+            self.current_slice_result = {
+                'z_target': z_target,
+                'slice_thickness': slice_thickness,
+                'xc': xc,
+                'yc': yc,
+                'R': R,
+                'ovality_pct': ovality_pct,
+                'edge_xy': edge_xy,
+                'theta_sorted': theta_sorted if 'theta_sorted' in locals() else None,
+                'delta_r_sorted': delta_r_sorted if 'delta_r_sorted' in locals() else None,
+                'n_points': len(slice_points)
+            }
+            
+            # Enable export slice button
+            self.export_slice_btn.setEnabled(True)
             
         except Exception as e:
             error_msg = str(e)
@@ -1198,6 +1716,7 @@ class CylinderAnalyzerGUI(QMainWindow):
                 self.statusBar().showMessage("Slice processing failed - check data quality and parameters")
             else:
                 self.statusBar().showMessage(f"Error: {error_msg} - try increasing thickness")
+
     def visualize_circular_slices(self):
         """Visualize circular slices in 3D VTK view based on analysis results"""
         if not hasattr(self, 'current_results') or not self.current_results:
@@ -1310,96 +1829,245 @@ class CylinderAnalyzerGUI(QMainWindow):
         self.statusBar().showMessage(f"Visualized {len(self.current_results)} slices along {['X','Y','Z'][main_axis]} axis")
 
     def compare_years(self):
-        # Select CSV files for comparison
-        filenames, _ = QFileDialog.getOpenFileNames(
+        """Compare current slice with data from multiple years' files"""
+        # Check if we have current slice data
+        if not hasattr(self, 'current_slice_result') or self.current_slice_result is None:
+            self.statusBar().showMessage("Please visualize a slice first before comparing")
+            return
+        
+        # Ask for number of years to compare
+        num_years, ok = QInputDialog.getInt(
             self,
-            "Select Results CSV Files for Comparison",
+            "Number of Years",
+            "Enter number of years to compare (minimum 1):",
+            value=1,
+            min=1,
+            max=10
+        )
+        
+        if not ok:
+            return
+        
+        # Create dialog for file selection
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Select Slice Files for {num_years} Years")
+        dialog.setModal(True)
+        
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"Select boundary_data.csv files for {num_years} years:"))
+        
+        # Create file selectors
+        file_buttons = []
+        file_labels = []
+        
+        for i in range(num_years):
+            hbox = QHBoxLayout()
+            label = QLabel(f"Year {i+1}: No file selected")
+            file_labels.append(label)
+            hbox.addWidget(label)
+            
+            btn = QPushButton("Browse...")
+            btn.clicked.connect(lambda checked, idx=i: self.select_comparison_file(idx, file_labels, file_buttons))
+            file_buttons.append(btn)
+            hbox.addWidget(btn)
+            
+            layout.addLayout(hbox)
+        
+        # OK/Cancel buttons
+        button_box = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_box.addWidget(ok_btn)
+        button_box.addWidget(cancel_btn)
+        layout.addLayout(button_box)
+        
+        # Store file paths
+        self.comparison_files = [None] * num_years
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Check if all files selected
+            if None in self.comparison_files:
+                self.statusBar().showMessage("Please select files for all years")
+                return
+            
+            try:
+                # Get current slice parameters
+                current_z = self.current_slice_result['z_target']
+                current_thickness = self.current_slice_result['slice_thickness']
+                
+                # Clear slice figure and create comparison plot
+                self.slice_figure.clear()
+                
+                # Create subplot for residual profiles
+                ax = self.slice_figure.add_subplot(1, 1, 1)
+                
+                # Define colors for different years (including current)
+                colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan', 'magenta']
+                
+                # Plot current slice data first (blue)
+                current_result = self.current_slice_result
+                if current_result['theta_sorted'] is not None and current_result['delta_r_sorted'] is not None:
+                    ax.plot(current_result['theta_sorted'], current_result['delta_r_sorted'], 
+                           color='blue', linewidth=2, label='Current Slice', alpha=0.8)
+                    ax.scatter(current_result['theta_sorted'], current_result['delta_r_sorted'], 
+                              color='blue', s=10, alpha=0.6)
+                
+                # Load and plot each comparison file
+                valid_comparisons = 0
+                for i, file_path in enumerate(self.comparison_files):
+                    try:
+                        df = pd.read_csv(file_path)
+                        
+                        # Validate file format
+                        required_cols = ['year', 'z_center', 'thickness', 'theta', 'delta_r']
+                        if not all(col in df.columns for col in required_cols):
+                            self.statusBar().showMessage(f"Skipping {os.path.basename(file_path)}: invalid format")
+                            continue
+                        
+                        # Filter data for matching z_center and thickness
+                        matching_slices = df[
+                            (np.isclose(df['z_center'], current_z, atol=1e-3)) & 
+                            (np.isclose(df['thickness'], current_thickness, atol=1e-3))
+                        ]
+                        
+                        if matching_slices.empty:
+                            self.statusBar().showMessage(f"Skipping {os.path.basename(file_path)}: no matching slice")
+                            continue
+                        
+                        # Get year from matching data
+                        comparison_year = str(matching_slices['year'].iloc[0])
+                        
+                        # Plot comparison data
+                        comparison_df_sorted = matching_slices.sort_values('theta')
+                        ax.plot(comparison_df_sorted['theta'], comparison_df_sorted['delta_r'], 
+                               color=colors[i+1], linewidth=2, label=f'Year {comparison_year}', alpha=0.8)
+                        ax.scatter(comparison_df_sorted['theta'], comparison_df_sorted['delta_r'], 
+                                  color=colors[i+1], s=10, alpha=0.6)
+                        
+                        valid_comparisons += 1
+                        
+                    except Exception as e:
+                        self.statusBar().showMessage(f"Error loading {os.path.basename(file_path)}: {str(e)}")
+                        continue
+                
+                if valid_comparisons == 0:
+                    self.statusBar().showMessage("No valid comparison data found")
+                    return
+                
+                # Add baseline
+                ax.axhline(0.0, color='k', linestyle='--', linewidth=1.5, label='Ideal circle (Δr=0)')
+                
+                ax.set_xlabel('θ (rad)')
+                ax.set_ylabel('Δr')
+                ax.set_title(f'Residual Profile Comparison - Current vs {valid_comparisons} Years\n'
+                            f'Z: {current_z:.3f}m, Thickness: {current_thickness:.3f}m')
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+                
+                self.slice_figure.tight_layout()
+                self.slice_canvas.draw()
+                
+                # Switch to slice tab
+                self.results_tabs.setCurrentIndex(2)
+                
+                self.statusBar().showMessage(f"Comparison completed - Current slice vs {valid_comparisons} years")
+                
+            except Exception as e:
+                self.statusBar().showMessage(f"Error during comparison: {str(e)}")
+    
+    def select_comparison_file(self, index, labels, buttons):
+        """Select file for comparison"""
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Select Boundary Data File for Year {index + 1}",
             "",
             "CSV Files (*.csv);;All Files (*.*)"
         )
         
-        if not filenames:
+        if filename:
+            self.comparison_files[index] = filename
+            labels[index].setText(f"Year {index + 1}: {os.path.basename(filename)}")
+
+    # NEW: Add method to export current slice data
+    def export_slice(self):
+        """Export data for the current visualized slice"""
+        if not hasattr(self, 'current_slice_result'):
+            self.statusBar().showMessage("No slice data to export")
             return
-            
+        
+        # Get year from user input
+        year, ok = QInputDialog.getText(
+            self,
+            "Enter Year",
+            "Enter the year this data was scanned:",
+            text=str(datetime.now().year)
+        )
+        
+        if not ok or not year.strip():
+            return
+        
         try:
-            # Create separate tab for comparison if not exists
-            if not hasattr(self, 'comparison_tab'):
-                self.comparison_tab = QWidget()
-                self.results_tabs.addTab(self.comparison_tab, "Year Comparison")
-                comparison_layout = QVBoxLayout(self.comparison_tab)
-                
-                # Create separate figure for comparison
-                self.comparison_figure = plt.figure(figsize=(10, 8))
-                self.comparison_canvas = FigureCanvasQTAgg(self.comparison_figure)
-                comparison_layout.addWidget(self.comparison_canvas)
+            year = year.strip()
             
-            # Load and combine data
-            all_data = []
-            for filename in filenames:
-                # Extract year from filename
-                year = os.path.basename(filename).split('_')[0]
-                
-                # Load CSV
-                df = pd.read_csv(filename)
-                df['Year'] = year  # Add year column
-                all_data.append(df)
+            # Get directory to save files
+            save_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Select Directory to Save Slice Data",
+                "",
+                QFileDialog.Option.ShowDirsOnly
+            )
             
-            # Combine all dataframes
-            combined_df = pd.concat(all_data, ignore_index=True)
+            if not save_dir:
+                return
             
-            # Clear comparison plots
-            self.comparison_figure.clear()
+            result = self.current_slice_result
             
-            # Plot 1: Ovality vs Z for different years
-            ax1 = self.comparison_figure.add_subplot(211)
-            for year in combined_df['Year'].unique():
-                year_data = combined_df[combined_df['Year'] == year]
-                ax1.plot(year_data['z_center'], year_data['ovality_pct'], 
-                        '-o', label=f'Year {year}', markersize=4)
+            # Prepare boundary data for export
+            export_data = []
             
-            ax1.set_xlabel('Z Position')
-            ax1.set_ylabel('Ovality %')
-            ax1.grid(True)
-            ax1.legend()
-            ax1.set_title('Ovality Comparison')
+            if result['edge_xy'] is not None and len(result['edge_xy']) > 0 and result['theta_sorted'] is not None and result['delta_r_sorted'] is not None:
+                # Create rows for each boundary point
+                for i, (theta_val, delta_r_val) in enumerate(zip(result['theta_sorted'], result['delta_r_sorted'])):
+                    export_data.append({
+                        'year': year,
+                        'z_center': result['z_target'],
+                        'cx': result['xc'],
+                        'cy': result['yc'],
+                        'R': result['R'],
+                        'thickness': result['slice_thickness'],
+                        'theta': theta_val,
+                        'delta_r': delta_r_val,
+                        'boundary_point_index': i
+                    })
+            else:
+                # If no boundary points, still export slice info with NaN delta_r
+                export_data.append({
+                    'year': year,
+                    'z_center': result['z_target'],
+                    'cx': result['xc'],
+                    'cy': result['yc'],
+                    'R': result['R'],
+                    'thickness': result['slice_thickness'],
+                    'theta': np.nan,
+                    'delta_r': np.nan,
+                    'boundary_point_index': 0
+                })
             
-            # Plot 2: Radius vs Z for different years
-            ax2 = self.comparison_figure.add_subplot(212)
-            for year in combined_df['Year'].unique():
-                year_data = combined_df[combined_df['Year'] == year]
-                ax2.plot(year_data['z_center'], year_data['R'], 
-                        '-o', label=f'Year {year}', markersize=4)
+            # Create DataFrame and save
+            df_export = pd.DataFrame(export_data)
+            export_path = os.path.join(save_dir, f"slice_{year}_{result['z_target']:.3f}m_{result['slice_thickness']:.3f}m_boundary_data.csv")
+            df_export.to_csv(export_path, index=False, float_format='%.6f')
             
-            ax2.set_xlabel('Z Position')
-            ax2.set_ylabel('Radius')
-            ax2.grid(True)
-            ax2.legend()
-            ax2.set_title('Radius Comparison')
-            
-            self.comparison_figure.tight_layout()
-            self.comparison_canvas.draw()
-            
-            # Switch to comparison tab
-            comparison_tab_index = self.results_tabs.indexOf(self.comparison_tab)
-            self.results_tabs.setCurrentIndex(comparison_tab_index)
-            
-            # Create comparison statistics
-            stats_text = "Comparison Statistics:\n\n"
-            for year in combined_df['Year'].unique():
-                year_data = combined_df[combined_df['Year'] == year]
-                stats_text += f"Year {year}:\n"
-                stats_text += f"  Mean Ovality: {year_data['ovality_pct'].mean():.3f}%\n"
-                stats_text += f"  Max Ovality: {year_data['ovality_pct'].max():.3f}%\n"
-                stats_text += f"  Mean Radius: {year_data['R'].mean():.3f}\n"
-                stats_text += f"  Radius Range: {year_data['R'].max() - year_data['R'].min():.3f}\n\n"
-            
-            # Update stats label
-            self.stats_label.setText(stats_text)
-            
-            self.statusBar().showMessage("Comparison completed successfully")
+            self.statusBar().showMessage(
+                f"Slice data exported to {save_dir} - {len(export_data)} boundary points"
+            )
             
         except Exception as e:
-            self.statusBar().showMessage(f"Error comparing data: {str(e)}")
+            self.statusBar().showMessage(f"Error exporting slice data: {str(e)}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

@@ -4,11 +4,12 @@ Main analysis module for processing cylinder point clouds
 import os
 import numpy as np
 import pandas as pd
-from typing import Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
+import concurrent.futures  # Added for multithreading
 
 from utils.data_io import load_txt_points, save_results  # Modified imports
-from utils.circle_fitting import fit_circle_pratt, lm_circle_geometric
+from utils.circle_fitting import fit_circle_pratt, lm_circle_geometric, fit_circle_hybrid_at_z  # MODIFIED: Import hybrid fit
 from utils.boundary import (boundary_by_angle_max, boundary_by_convex_hull, 
                           ovality_and_fourier)
 from utils.visualization import plot_slice, plot_summary, plot_overlay
@@ -16,7 +17,6 @@ from utils.visualization import plot_slice, plot_summary, plot_overlay
 @dataclass
 class Config:
     """Analysis configuration parameters"""
-    window_len: float = 9.0
     z_step: float = 2.0
     max_points_for_speed: int = 1_000_000
     min_points_per_slice: int = 1000
@@ -26,12 +26,14 @@ class Config:
     draw_per_slice_images: bool = True
     slice_plot_sample_points: int = 30000
     overlay_all: bool = True
+    z_min: Optional[float] = None
+    z_max: Optional[float] = None
 
 class CylinderAnalyzer:
     def __init__(self, config: Config = None):
         self.config = config or Config()
-        self.dz = self.config.window_len / 2.0
-        
+        self.z_min = self.config.z_min
+        self.z_max = self.config.z_max
         # Output paths
         self.slice_fig_dir = 'plots_slices'
         self.results_csv = 'slice_results.csv'
@@ -40,11 +42,12 @@ class CylinderAnalyzer:
         
         # Create output directory
         os.makedirs(self.slice_fig_dir, exist_ok=True)
-        
+    
     def process_slice(self, points: np.ndarray, z_center: float) -> Tuple[dict, pd.DataFrame, str]:
         """Process a single slice of points"""
-        # Filter points in z-window
-        mask = (points[:,2] >= z_center - self.dz) & (points[:,2] <= z_center + self.dz)
+        # Filter points in z-window (using z_step for dz)
+        dz = self.config.z_step / 2.0
+        mask = (points[:,2] >= z_center - dz) & (points[:,2] <= z_center + dz)
         slc = points[mask][:,:2]  # Only x,y
         n0 = len(slc)
         
@@ -56,53 +59,49 @@ class CylinderAnalyzer:
             slc = slc[idx]
             n0 = len(slc)
 
-        # Extract boundary
-        try:
-            if self.config.boundary_method == 'convex_hull':
-                edge_xy = boundary_by_convex_hull(slc)
-            else:
-                edge_xy = boundary_by_angle_max(slc, center=None, 
-                                              bins=self.config.angle_bins)
-        except RuntimeError as e:
-            return None, None, f"SKIP zc={z_center:.3f}: {e}"
-
-        # Initial Pratt fit
-        xc1, yc1, R1 = fit_circle_pratt(edge_xy[:,0], edge_xy[:,1])
+        # MODIFIED: Use hybrid circle fitting instead of old Pratt + LM
+        hybrid_result = fit_circle_hybrid_at_z(
+            points_xyz=points[mask],  # Pass full XYZ for z-filtering
+            z_elevation=z_center,
+            z_tolerance=dz,
+            inlier_tol=0.5,  # Default values, can be parameterized later
+            max_trials=4000,
+            min_inliers_frac=0.1,
+            huber_delta=1.0,
+            use_hull_vertices_only=True
+        )
         
-        # Get inliers
-        rho1 = np.hypot(edge_xy[:,0]-xc1, edge_xy[:,1]-yc1)
-        res1 = np.abs(rho1 - R1)
-        thr = np.quantile(res1, self.config.inlier_quantile)
-        good = res1 <= thr
+        if hybrid_result is None:
+            return None, None, f"SKIP zc={z_center:.3f}: hybrid fit failed"
         
-        # Refined fits
-        xc2, yc2, R2 = fit_circle_pratt(edge_xy[good,0], edge_xy[good,1])
-        xc3, yc3, R3, cost = lm_circle_geometric(edge_xy[good,0], edge_xy[good,1], 
-                                                xc2, yc2, R2)
-
-        # Calculate metrics
-        dx = edge_xy[:,0] - xc3
-        dy = edge_xy[:,1] - yc3
+        # Extract fitted parameters
+        cx, cy, R = hybrid_result["center_x"], hybrid_result["center_y"], hybrid_result["radius"]
+        candidates_xy = hybrid_result["candidates_xy"]  # Boundary points used for fitting
+        inlier_mask = hybrid_result["inlier_mask"]
+        
+        # Calculate metrics using candidates (boundary points)
+        dx = candidates_xy[:,0] - cx
+        dy = candidates_xy[:,1] - cy
         rad = np.hypot(dx, dy)
         ang = (np.arctan2(dy, dx) + 2*np.pi) % (2*np.pi)
         
         # Get extreme points
         i_max = int(np.argmax(rad))
         i_min = int(np.argmin(rad))
-        x_rmax, y_rmax = float(edge_xy[i_max,0]), float(edge_xy[i_max,1])
-        x_rmin, y_rmin = float(edge_xy[i_min,0]), float(edge_xy[i_min,1])
+        x_rmax, y_rmax = float(candidates_xy[i_max,0]), float(candidates_xy[i_max,1])
+        x_rmin, y_rmin = float(candidates_xy[i_min,0]), float(candidates_xy[i_min,1])
 
         # Ovality analysis
-        ov = ovality_and_fourier(edge_xy[:,0], edge_xy[:,1], xc3, yc3, R3)
+        ov = ovality_and_fourier(candidates_xy[:,0], candidates_xy[:,1], cx, cy, R)
         
         # Compile results
         result = {
             "z_center": z_center,
-            "z_low": z_center - self.dz, 
-            "z_high": z_center + self.dz,
+            "z_low": z_center - dz, 
+            "z_high": z_center + dz,
             "n_points_slice": int(n0),
-            "n_edge": int(len(edge_xy)),
-            "cx": xc3, "cy": yc3, "R": R3,
+            "n_edge": int(len(candidates_xy)),  # Number of boundary points
+            "cx": cx, "cy": cy, "R": R,
             "Rmax": ov["Rmax"], 
             "Rmin": ov["Rmin"],
             "x_at_Rmax": x_rmax, 
@@ -112,36 +111,35 @@ class CylinderAnalyzer:
             "ovality_abs": ov["ovality_abs"],
             "ovality_pct": ov["ovality_pct"],
             "k2_amp": ov["k2_amp"],
-            "cost": cost
+            "cost": 0.0,  # Hybrid fit doesn't return cost, set to 0
+            # NEW: Add boundary points for residual profile computation in GUI
+            "boundary_points": candidates_xy.tolist()  # List of [x, y] pairs
         }
         
-        # Record boundary points
+        # Record boundary points (for CSV export)
         edge_records = pd.DataFrame({
             "z_center": z_center,
-            "x": edge_xy[:,0],
-            "y": edge_xy[:,1],
+            "x": candidates_xy[:,0],
+            "y": candidates_xy[:,1],
             "radius": rad,
             "theta": ang,
-            "inlier80": good.astype(int)
+            "inlier": inlier_mask.astype(int)  # Use inlier mask from hybrid fit
         })
         
-        return (result, edge_xy, slc, (xc3, yc3, R3), ov), edge_records, None
-
+        return (result, candidates_xy, slc, (cx, cy, R), ov), edge_records, None
+    
     def analyze_file(self, file_path: str):
         """Process entire point cloud file"""
-        # Load points
         points = load_txt_points(file_path)
         z_min, z_max = points[:,2].min(), points[:,2].max()
         print(f"Z range in data: [{z_min:.3f}, {z_max:.3f}]  "
-              f"| window={self.config.window_len}  step={self.config.z_step}")
+              f"| step={self.config.z_step}")
         
-        # Define z-centers
-        if z_max - z_min < self.config.window_len:
-            z_centers = np.array([(z_min + z_max)/2.0])
-        else:
-            z_centers = np.arange(z_min + self.dz, 
-                                z_max - self.dz + 1e-9, 
-                                self.config.z_step)
+        # Define z-centers (using z_step only)
+        dz = self.config.z_step / 2.0
+        z_centers = np.arange(z_min + dz, 
+                            z_max - dz + 1e-9, 
+                            self.config.z_step)
         
         results = []
         point_rows = []
@@ -152,7 +150,7 @@ class CylinderAnalyzer:
             if warn is not None:
                 print(warn)
                 continue
-                
+            
             res, edge_xy, slc, (xc, yc, R), ov = out
             results.append(res)
             if edge_df is not None:
@@ -162,7 +160,7 @@ class CylinderAnalyzer:
             if self.config.draw_per_slice_images:
                 out_png = os.path.join(self.slice_fig_dir, f"slice_zc={zc:.3f}.png")
                 plot_slice(slc, edge_xy, (xc,yc), R, res, 
-                          self.config.window_len, self.config.z_step,
+                          self.config.z_step, self.config.z_step,  # Use z_step for both
                           self.config.boundary_method, out_png,
                           self.config.slice_plot_sample_points)
         
@@ -172,17 +170,17 @@ class CylinderAnalyzer:
             df_res = pd.DataFrame(results)
             
             # Generate summary plots
-            plot_summary(df_res, self.config.window_len, self.config.z_step)
+            plot_summary(df_res, self.config.z_step, self.config.z_step)  # Use z_step for both
             
             # Generate overlay plot
             if self.config.overlay_all:
                 df_pts = pd.concat(point_rows, ignore_index=True) if point_rows else None
                 plot_overlay(df_res, df_pts, self.overlay_png)
                 print(f"Saved overlay plot -> {self.overlay_png}")
-                
+    
     def analyze_with_progress(self, points: np.ndarray, progress_callback=None):
         """
-        Analyze points with progress reporting
+        Analyze points with progress reporting using multithreading
         """
         if not isinstance(points, np.ndarray):
             points = np.array(points)
@@ -190,39 +188,56 @@ class CylinderAnalyzer:
         if points.ndim != 2 or points.shape[1] != 3:
             raise ValueError("Points must be Nx3 array")
 
+        # Filter points to specified Z range if provided
+        if self.z_min is not None and self.z_max is not None:
+            mask = (points[:, 2] >= self.z_min) & (points[:, 2] <= self.z_max)
+            points = points[mask]
+            if len(points) == 0:
+                raise ValueError(f"No points in specified Z range [{self.z_min}, {self.z_max}]")
+
         results = []
         z_centers = self.calculate_z_centers(points)
         total = len(z_centers)
 
-        for i, zc in enumerate(z_centers):
-            mask = (points[:, 2] >= zc - self.dz) & (points[:, 2] <= zc + self.dz)
-            slice_points = points[mask]
+        # Use ThreadPoolExecutor with CPU-scaled thread count
+        max_workers = os.cpu_count()  # Scale according to available CPU cores
+        print(f"Using {max_workers} threads for analysis...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all slice processing tasks
+            future_to_zc = {executor.submit(self.process_slice, points, zc): zc for zc in z_centers}
             
-            if len(slice_points) < self.config.min_points_per_slice:
-                continue
+            completed_count = 0
+            for future in concurrent.futures.as_completed(future_to_zc):
+                zc = future_to_zc[future]
+                try:
+                    result_tuple, edge_df, warn = future.result()
+                    if result_tuple is not None:
+                        result_dict, _, _, _, _ = result_tuple  # Unpack the tuple
+                        results.append(result_dict)  # Append only the dictionary
+                except Exception as e:
+                    print(f"Error processing slice at z={zc}: {str(e)}")
+                    continue
 
-            try:
-                result_tuple, edge_df, warn = self.process_slice(slice_points, zc)
-                if result_tuple is not None:
-                    result_dict, _, _, _, _ = result_tuple  # Unpack the tuple
-                    results.append(result_dict)  # Append only the dictionary
-            except Exception as e:
-                print(f"Error processing slice at z={zc}: {str(e)}")
-                continue
+                # Update progress
+                completed_count += 1
+                progress = int(completed_count / total * 100)
+                if progress_callback:
+                    progress_callback(progress)
 
-            if progress_callback:
-                progress = int((i + 1) / total * 100)
-                progress_callback(progress)
+        # Sort results by z_center to maintain order
+        results.sort(key=lambda x: x['z_center'])
 
         return results  # Now returns list of dictionaries
 
     def calculate_z_centers(self, points: np.ndarray) -> np.ndarray:
         """Calculate z-centers for slicing"""
-        z_min, z_max = points[:,2].min(), points[:,2].max()
-        
-        if z_max - z_min < self.config.window_len:
-            return np.array([(z_min + z_max) / 2.0])
+        # Use specified z_min/z_max if provided, otherwise use data range
+        if self.z_min is not None and self.z_max is not None:
+            z_min, z_max = self.z_min, self.z_max
         else:
-            return np.arange(z_min + self.dz, 
-                            z_max - self.dz + 1e-9, 
-                            self.config.z_step)
+            z_min, z_max = points[:, 2].min(), points[:, 2].max()
+        
+        dz = self.config.z_step / 2.0
+        return np.arange(z_min + dz, 
+                        z_max - dz + 1e-9, 
+                        self.config.z_step)
